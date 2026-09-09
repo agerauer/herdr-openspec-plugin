@@ -1,0 +1,18 @@
+id = "herdr.openspec-review"
+name = "OpenSpec Review"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Review active OpenSpec changes in a focused Herdr sidebar"
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "open-sidebar"
+title = "Open OpenSpec review sidebar"
+contexts = ["workspace", "pane"]
+command = ["python3", "scripts/open_sidebar.py"]
+
+[[panes]]
+id = "review"
+title = "OpenSpec Review"
+placement = "split"
+command = ["python3", "sidebar.py"]
