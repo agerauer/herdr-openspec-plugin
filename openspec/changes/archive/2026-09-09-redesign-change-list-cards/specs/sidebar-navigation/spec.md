@@ -1,10 +1,4 @@
-# Sidebar Navigation Specification
-
-## Purpose
-
-Provide efficient, predictable keyboard and mouse navigation for active changes, their artifacts, and rendered OpenSpec documents in the Herdr sidebar.
-
-## Requirements
+## ADDED Requirements
 
 ### Requirement: Change rows render as inline cards
 
@@ -49,25 +43,6 @@ The sidebar SHALL indicate worktree-touched changes with color on the change nam
 - **WHEN** a change is not worktree-touched
 - **THEN** its card name is shown in the default color and no icon precedes the name
 
-### Requirement: Change-list capacity adapts to pane height
-The sidebar SHALL display as many whole active change cards as the pane height fits, with no fixed upper limit, and SHALL reduce the count only as needed to keep the message and footer rows usable without overlap. Because each change is a multi-line card, fewer changes fit a given height than single-line rows did. At least one card SHALL be shown whenever any room remains.
-
-#### Scenario: Tall pane contains at least 15 changes
-- **WHEN** the pane has vertical space for at least 15 change cards plus the message and footer rows and at least 15 active changes exist
-- **THEN** the change list displays at least 15 change cards at once
-
-#### Scenario: Pane cannot fit 15 changes and the remaining regions
-- **WHEN** the pane does not have room for every change card plus the message and footer rows
-- **THEN** the sidebar displays the largest number of whole change cards that fits the available height
-
-#### Scenario: Pane has room for more than 15 cards
-- **WHEN** the pane is tall enough for more than 15 change cards and more than 15 active changes exist
-- **THEN** the change list displays more than 15 change cards, limited only by the available height
-
-#### Scenario: Selection moves beyond the visible change window
-- **WHEN** keyboard or mouse navigation selects a change outside the current visible window
-- **THEN** the change-list window adjusts so the selected change's card remains visible
-
 ### Requirement: The main footer lists the available shortcuts
 
 The change-list footer SHALL present the main view's shortcuts — movement, open, the artifact-document keys, edit, validate, refresh, and close — so they are discoverable at a glance, and hints that do not fit the pane width on one row SHALL wrap onto further rows rather than be dropped. The open, document-keys, edit, validate, refresh, and close hints SHALL be clickable and perform their action; clicking the document-keys hint SHALL open the selected change's Proposal. The movement hint MAY be shown as a display-only legend without a click target.
@@ -87,54 +62,26 @@ The change-list footer SHALL present the main view's shortcuts — movement, ope
 - **WHEN** the change-list footer displays the open, edit, validate, refresh, and close hints
 - **THEN** each of those hints is clickable and performs the same action as its keyboard shortcut
 
-### Requirement: Footer hints support equivalent mouse actions
-Every visible action hint in the bottom footer SHALL be clickable and SHALL perform the same action as its displayed keyboard shortcut.
+## MODIFIED Requirements
 
-#### Scenario: User clicks a main-view footer action
-- **WHEN** the user clicks the visible open, validate, or close hint in the main-view footer
-- **THEN** the sidebar performs the same action as Enter, `v`, or `q`, respectively
+### Requirement: Change-list capacity adapts to pane height
+The sidebar SHALL display as many whole active change cards as the pane height fits, with no fixed upper limit, and SHALL reduce the count only as needed to keep the message and footer rows usable without overlap. Because each change is a multi-line card, fewer changes fit a given height than single-line rows did. At least one card SHALL be shown whenever any room remains.
 
-#### Scenario: User clicks a viewer footer action
-- **WHEN** the user clicks the visible back, edit, or close hint in the document-viewer footer
-- **THEN** the sidebar performs the same action as Left/Escape, `e`, or `q`, respectively
+#### Scenario: Tall pane contains at least 15 changes
+- **WHEN** the pane has vertical space for at least 15 change cards plus the message and footer rows and at least 15 active changes exist
+- **THEN** the change list displays at least 15 change cards at once
 
-#### Scenario: Footer hint is clipped by pane width
-- **WHEN** a footer hint is not rendered because the pane is too narrow
-- **THEN** the non-visible hint has no clickable region
+#### Scenario: Pane cannot fit 15 changes and the remaining regions
+- **WHEN** the pane does not have room for every change card plus the message and footer rows
+- **THEN** the sidebar displays the largest number of whole change cards that fits the available height
 
-### Requirement: Document scrolling distinguishes lines from pages
-The document viewer SHALL reliably scroll in both directions by one wrapped visual line for each Up/Down keypress and each recognized mouse-wheel step, while Page Up/Page Down SHALL scroll by one visible document page.
+#### Scenario: Pane has room for more than 15 cards
+- **WHEN** the pane is tall enough for more than 15 change cards and more than 15 active changes exist
+- **THEN** the change list displays more than 15 change cards, limited only by the available height
 
-#### Scenario: User presses an arrow key in a document
-- **WHEN** the user presses Up or Down while reading an open artifact
-- **THEN** the document offset moves by one wrapped visual line in the corresponding direction
-
-#### Scenario: User turns the mouse wheel in a document
-- **WHEN** the document viewer receives one upward or downward mouse-wheel event
-- **THEN** the document offset moves by one wrapped visual line in the corresponding direction
-
-#### Scenario: User scrolls downward with the mouse wheel
-- **WHEN** the terminal reports any supported encoding of one downward mouse-wheel step while a document is open
-- **THEN** the document offset increases by one wrapped visual line unless already at the lower boundary
-
-#### Scenario: User presses a page navigation key
-- **WHEN** the user presses Page Up or Page Down while reading an open artifact
-- **THEN** the document offset moves by one visible document page in the corresponding direction
-
-#### Scenario: Scroll reaches a document boundary
-- **WHEN** a line or page scroll would move before the first line or beyond the last available offset
-- **THEN** the document offset is clamped to the valid document range
-
-### Requirement: Viewer header provides mouse back navigation
-The document viewer SHALL expose its visible top back affordance as a mouse target that performs the same back action as the viewer's keyboard and footer controls. Visible artifact tabs in that header SHALL remain independent mouse targets and SHALL NOT be treated as empty header space.
-
-#### Scenario: User clicks the viewer header back affordance
-- **WHEN** the user left-clicks the visible back affordance at the top of an open document
-- **THEN** the document viewer closes and the selected change and artifact remain available in the main view
-
-#### Scenario: User clicks outside the viewer header target
-- **WHEN** the user clicks elsewhere in the viewer header where no mouse action is displayed, including no back affordance and no artifact tab
-- **THEN** the open document and current offset remain unchanged
+#### Scenario: Selection moves beyond the visible change window
+- **WHEN** keyboard or mouse navigation selects a change outside the current visible window
+- **THEN** the change-list window adjusts so the selected change's card remains visible
 
 ### Requirement: Core artifacts have direct keyboard shortcuts
 The sidebar SHALL use `p`, `d`, and `t` to open Proposal, Design, and Tasks, and `s` to open or cycle specifications, for the selected change. These shortcuts SHALL work while the change list has focus and while a document is open. Pressing `s` from the change list SHALL open the first specification in deterministic path order. Pressing `s` in the document viewer SHALL advance to the next specification and wrap to the first after the last.
@@ -172,24 +119,38 @@ The sidebar SHALL use `p`, `d`, and `t` to open Proposal, Design, and Tasks, and
 - **THEN** the shortcut switches the open document as specified above without requiring a return to the change list first
 
 ### Requirement: Edit action prefers Visual Studio Code
-The edit action SHALL open the selected change's folder with the `code` executable when it is available on `PATH`, from both the change list and the document viewer, and SHALL report that opening the folder is unavailable when `code` is not on `PATH`. The edit action SHALL NOT open an individual file or fall back to `vi`.
+The document viewer's edit action SHALL open the current artifact with the `code` executable when it is available on `PATH`, and SHALL otherwise open it with `vi`. From the change list, the edit action SHALL open the selected change's folder with the `code` executable when it is available on `PATH`, and SHALL report that opening the folder is unavailable when `code` is not on `PATH`.
 
 #### Scenario: Visual Studio Code command is available
-- **WHEN** the user invokes edit and `code` is available on `PATH`
-- **THEN** the sidebar launches `code` with the selected change's folder path
+- **WHEN** the user invokes edit for an open artifact and `code` is available on `PATH`
+- **THEN** the sidebar launches `code` with that artifact's path
 
 #### Scenario: Visual Studio Code command is unavailable
-- **WHEN** the user invokes edit and `code` is not available on `PATH`
-- **THEN** the sidebar reports that opening the folder is unavailable and does not launch `vi`
+- **WHEN** the user invokes edit for an open artifact and `code` is not available on `PATH`
+- **THEN** the sidebar launches `vi` with that artifact's path
 
 #### Scenario: User opens a change folder from the change list
-- **WHEN** the change list is focused and the user invokes edit while `code` is available on `PATH`
+- **WHEN** the change list is focused, no document is open, and the user invokes edit while `code` is available on `PATH`
 - **THEN** the sidebar launches `code` with the selected change's folder path
 
-#### Scenario: User opens the change folder from the document viewer
-- **WHEN** a document is open and the user invokes edit while `code` is available on `PATH`
-- **THEN** the sidebar launches `code` with the selected change's folder path rather than editing the open file
-
 #### Scenario: Change-folder edit without Visual Studio Code
-- **WHEN** the user invokes edit while `code` is not available on `PATH`
+- **WHEN** the change list is focused, no document is open, and the user invokes edit while `code` is not available on `PATH`
 - **THEN** the sidebar reports that opening the folder is unavailable and does not launch `vi`
+
+## REMOVED Requirements
+
+### Requirement: Change and artifact rows support mouse activation
+**Reason**: The main view no longer shows an artifact list, and change rows became multi-line cards. Change-card mouse activation is now specified by "Change rows render as inline cards"; artifact activation happens through the document viewer's tabs.
+**Migration**: Click a change card to select it (see "Change rows render as inline cards"); open and switch artifacts via the viewer tabs (`document-viewer-tabs`) or the `p`/`d`/`t`/`s` shortcuts.
+
+### Requirement: Core artifacts precede specifications
+**Reason**: This requirement ordered the main view's artifact rows, which no longer exist.
+**Migration**: Artifact order (Proposal, Design, Tasks, then specifications in deterministic path order) is specified for the document viewer by `document-viewer-tabs`.
+
+### Requirement: Artifact-list capacity adapts to pane height
+**Reason**: The main view no longer shows an always-visible artifact list, so there is no artifact viewport to size or `ARTIFACTS (N)` heading to render.
+**Migration**: The artifact count is shown on each change card's status line; artifacts are opened with `p`/`d`/`t`/`s` or Enter and browsed via the viewer tabs (`document-viewer-tabs`).
+
+### Requirement: Main-view focus returns predictably to changes
+**Reason**: There is no artifact-list focus in the main view to return from; the change list is the only main-view focus.
+**Migration**: Escape from an open document returns to the main view with the selected change intact, as specified by the document viewer.

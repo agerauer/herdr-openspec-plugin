@@ -1,10 +1,4 @@
-# Change List Task Progress Specification
-
-## Purpose
-
-Make task completion for every active OpenSpec change visible while scanning the sidebar's primary change list.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Each change row displays task progress
 The sidebar SHALL display the number of completed checklist tasks and the total number of checklist tasks for every active change on that change's card status line, formatted as `X/Y` alongside the change's status and artifact count.

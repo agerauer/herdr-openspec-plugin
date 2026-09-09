@@ -26,7 +26,10 @@ from sidebar import (
     discover_openspec_projects,
     display_change_name,
     find_project,
-    format_change_row,
+    format_card_name,
+    format_card_status,
+    truncate,
+    CARD_ROWS,
     format_delta_summary,
     hit_test,
     mouse_bits,
@@ -39,8 +42,25 @@ from sidebar import (
     resolve_search_root,
     run_git,
     sort_changes,
+    wrap_viewer_header,
+    doc_artifact_title,
+    non_standard_indexes,
+    tab_group_pair,
+    viewer_tab_items,
+    TAB_PAIR_STANDARD,
+    TAB_PAIR_DOC,
+    TAB_PAIR_SPEC,
     visible_footer_segments,
-    wrap_document,
+    emphasis_attr,
+    line_width,
+    visible_width,
+    render_inline,
+    render_markdown,
+    wrap_spans,
+    create_markdown,
+    HEADING_PAIRS,
+    PAIR_CODE,
+    PAIR_LINK,
 )
 from scripts.open_sidebar import openspec_project, plugin_pane, project_token, split_path
 
@@ -400,6 +420,9 @@ class SidebarModelTests(unittest.TestCase):
         sidebar.focus = "changes"
         sidebar.viewer = None
         sidebar.viewer_offset = 0
+        sidebar.italic_attr = curses.A_ITALIC
+        sidebar._render_cache_key = None
+        sidebar._render_cache_lines = []
         sidebar.hit_targets = []
         sidebar.message = ""
         sidebar.message_until = 0.0
@@ -442,29 +465,24 @@ class SidebarModelTests(unittest.TestCase):
         self.assertEqual(sidebar.change_index, 1)
         self.assertEqual(sidebar.focus, "changes")
 
-    def test_left_click_opens_an_existing_artifact(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "proposal.md"
-            path.write_text("# Proposal", encoding="utf-8")
-            artifact = Artifact("proposal", "Proposal", path, content="# Proposal")
-            sidebar = self.make_sidebar([artifact])
-            sidebar.hit_targets = [HitTarget(10, 2, 11, 20, "open_artifact", 0)]
+    def test_left_click_on_a_card_selects_that_change(self):
+        sidebar = self.make_sidebar()
+        sidebar.change_index = 0
+        sidebar.hit_targets = [HitTarget(4, 1, 7, 60, "select_change", 1)]
 
-            sidebar.handle_mouse(5, 10, self.left_click())
+        sidebar.handle_mouse(10, 5, self.left_click())
 
-            self.assertIs(sidebar.viewer, artifact)
-            self.assertEqual(sidebar.focus, "artifacts")
+        self.assertEqual(sidebar.change_index, 1)
+        self.assertEqual(sidebar.focus, "changes")
 
-    def test_left_click_reports_a_missing_artifact(self):
-        artifact = Artifact("tasks", "Tasks", None)
-        sidebar = self.make_sidebar([artifact])
-        sidebar.hit_targets = [HitTarget(10, 2, 11, 20, "open_artifact", 0)]
+    def test_left_click_on_empty_space_leaves_selection_unchanged(self):
+        sidebar = self.make_sidebar()
+        sidebar.change_index = 0
+        sidebar.hit_targets = [HitTarget(4, 1, 7, 60, "select_change", 1)]
 
-        sidebar.handle_mouse(5, 10, self.left_click())
+        sidebar.handle_mouse(10, 20, self.left_click())  # below the card
 
-        self.assertIsNone(sidebar.viewer)
-        self.assertEqual(sidebar.message, "Artifact does not exist yet")
-        self.assertEqual(sidebar.artifact_index, 0)
+        self.assertEqual(sidebar.change_index, 0)
 
     def test_viewer_header_back_label_is_clickable_and_clipped(self):
         artifact = Artifact(
@@ -480,8 +498,9 @@ class SidebarModelTests(unittest.TestCase):
             sidebar.draw_viewer()
 
         target = next(target for target in sidebar.hit_targets if target.action == "back")
-        self.assertTrue(target.contains(0, 1))
-        self.assertFalse(target.contains(0, target.right))
+        self.assertEqual(target.top, 1)  # tab bar sits below the name heading on row 0
+        self.assertTrue(target.contains(target.top, target.left))
+        self.assertFalse(target.contains(target.top, target.right))
 
         sidebar.handle_mouse(target.left, target.top, self.left_click())
         self.assertIsNone(sidebar.viewer)
@@ -520,12 +539,46 @@ class SidebarModelTests(unittest.TestCase):
     def test_all_main_footer_hints_dispatch_their_keyboard_actions(self):
         sidebar = self.make_sidebar([Artifact("proposal", "Proposal", None)])
         sidebar.validate = unittest.mock.Mock()
+        sidebar.edit = unittest.mock.Mock()
+        sidebar.reload = unittest.mock.Mock()
 
-        self.assertTrue(sidebar.dispatch_action("open"))
-        self.assertEqual(sidebar.focus, "artifacts")
+        self.assertTrue(sidebar.dispatch_action("open"))  # opens the Proposal
+        self.assertTrue(sidebar.dispatch_action("edit"))
+        sidebar.edit.assert_called_once_with()
         self.assertTrue(sidebar.dispatch_action("validate"))
         sidebar.validate.assert_called_once_with()
+        self.assertTrue(sidebar.dispatch_action("refresh"))
+        sidebar.reload.assert_called_once_with(force=True)
         self.assertFalse(sidebar.dispatch_action("close"))
+
+    def test_main_footer_lists_all_shortcuts_with_clickable_docs_hint(self):
+        sidebar = self.make_sidebar()
+
+        with patch("sidebar.curses.color_pair", return_value=0):
+            sidebar.draw_main()
+
+        footer_text = " ".join(text for y, _x, text, _s in sidebar.screen.writes if y >= 28)
+        for hint in (
+            "↑↓ move",
+            "↵ open",
+            "p/d/t/s docs",
+            "e folder",
+            "v validate",
+            "r refresh",
+            "q close",
+        ):
+            self.assertIn(hint, footer_text)
+        actions = {target.action for target in sidebar.hit_targets}
+        self.assertIn("refresh", actions)  # single-action hints stay clickable
+        self.assertNotIn("move", actions)  # the movement legend registers no target
+
+        # The document-keys hint is clickable and opens the Proposal.
+        dy, dx, _text, _s = next(
+            write for write in sidebar.screen.writes if write[2] == "p/d/t/s docs"
+        )
+        self.assertTrue(
+            any(t.action == "open" and t.top == dy and t.left == dx for t in sidebar.hit_targets)
+        )
 
     def test_all_viewer_footer_hints_dispatch_their_keyboard_actions(self):
         sidebar = self.make_sidebar()
@@ -539,10 +592,10 @@ class SidebarModelTests(unittest.TestCase):
         self.assertIsNone(sidebar.viewer)
         self.assertFalse(sidebar.dispatch_action("close"))
 
-    def test_edit_prefers_code_and_restores_sidebar(self):
+    def test_edit_opens_the_change_folder_from_the_viewer(self):
         artifact = Artifact("proposal", "Proposal", Path("/tmp/proposal.md"))
         sidebar = self.make_sidebar([artifact])
-        sidebar.viewer = artifact
+        sidebar.viewer = artifact  # a document is open
         sidebar.screen.refresh = Mock()
         sidebar.reload = Mock()
 
@@ -556,48 +609,63 @@ class SidebarModelTests(unittest.TestCase):
         which.assert_called_once_with("code")
         endwin.assert_called_once_with()
         run.assert_called_once_with(
-            ["/usr/local/bin/code", "/tmp/proposal.md"],
+            ["/usr/local/bin/code", str(sidebar.change.path)],  # the folder, not the open file
             cwd=sidebar.project,
             check=False,
         )
         sidebar.screen.refresh.assert_called_once_with()
         sidebar.reload.assert_called_once_with(force=True)
 
-    def test_edit_falls_back_to_vi_when_code_is_unavailable(self):
-        artifact = Artifact("tasks", "Tasks", Path("/tmp/tasks.md"))
-        sidebar = self.make_sidebar([artifact])
-        sidebar.viewer = artifact
+    def test_edit_opens_the_change_folder_from_the_change_list(self):
+        sidebar = self.make_sidebar()
+        sidebar.viewer = None
+        sidebar.change_index = 0
         sidebar.screen.refresh = Mock()
         sidebar.reload = Mock()
 
         with (
-            patch("sidebar.shutil.which", return_value=None),
+            patch("sidebar.shutil.which", return_value="/usr/local/bin/code") as which,
             patch("sidebar.curses.endwin"),
             patch("sidebar.subprocess.run") as run,
         ):
             sidebar.edit()
 
+        which.assert_called_once_with("code")
         run.assert_called_once_with(
-            ["vi", "/tmp/tasks.md"],
+            ["/usr/local/bin/code", str(sidebar.change.path)],
             cwd=sidebar.project,
             check=False,
         )
-        sidebar.screen.refresh.assert_called_once_with()
-        sidebar.reload.assert_called_once_with(force=True)
 
-    def test_enter_then_escape_returns_focus_to_selected_change(self):
-        sidebar = self.make_sidebar([Artifact("proposal", "Proposal", None)])
+    def test_edit_reports_when_code_is_unavailable_for_a_folder(self):
+        sidebar = self.make_sidebar()
+        sidebar.viewer = None
 
-        sidebar.handle(curses.KEY_ENTER)
-        self.assertEqual(sidebar.focus, "artifacts")
-        sidebar.handle(27)
+        with (
+            patch("sidebar.shutil.which", return_value=None),
+            patch("sidebar.subprocess.run") as run,
+        ):
+            sidebar.edit()
 
-        self.assertEqual(sidebar.focus, "changes")
-        self.assertEqual(sidebar.change_index, 0)
+        run.assert_not_called()  # a directory is not opened with vi
+        self.assertIn("code", sidebar.message)
 
-        sidebar.handle(27)
-        self.assertEqual(sidebar.focus, "changes")
-        self.assertEqual(sidebar.change_index, 0)
+    def test_enter_opens_the_proposal_from_the_change_list(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "proposal.md"
+            path.write_text("# Proposal", encoding="utf-8")
+            proposal = Artifact("proposal", "Proposal", path, content="# Proposal")
+            sidebar = self.make_sidebar([proposal, Artifact("tasks", "Tasks", None)])
+
+            sidebar.handle(curses.KEY_ENTER)
+            self.assertIs(sidebar.viewer, proposal)
+
+            # Escape in the main view is a harmless no-op now that there is no
+            # separate artifact focus to return from.
+            sidebar.dispatch_action("viewer_back")
+            sidebar.handle(27)
+            self.assertIsNone(sidebar.viewer)
+            self.assertEqual(sidebar.change_index, 0)
 
     def test_escape_from_viewer_retains_selected_artifact(self):
         artifacts = [
@@ -659,11 +727,310 @@ class SidebarModelTests(unittest.TestCase):
         self.assertEqual(sidebar.artifact_index, 1)
         self.assertIsNone(sidebar.viewer)
 
-        sidebar.focus = "changes"
-        sidebar.viewer = artifacts[1]
-        sidebar.handle(ord("p"))
-        self.assertEqual(sidebar.artifact_index, 1)
-        self.assertIs(sidebar.viewer, artifacts[1])
+    def test_viewer_header_places_back_and_all_tabs_on_one_wide_row(self):
+        tabs = [(0, "Proposal"), (1, "Design"), (2, "Tasks"), (3, "auth")]
+        rows = wrap_viewer_header(80, tabs, 0)
+        segments = [segment for row in rows for segment in row]
+
+        self.assertEqual(len(rows), 1)  # all fit one row when wide
+        self.assertEqual(
+            [segment.label.strip() for segment in segments],
+            ["‹", "Proposal", "Design", "Tasks", "auth"],
+        )
+        self.assertEqual(segments[0].action, "back")
+        self.assertTrue(segments[1].selected)
+        self.assertFalse(any(segment.selected for segment in segments[2:]))
+
+    def test_viewer_header_wraps_tabs_onto_more_rows_when_narrow(self):
+        tabs = [(0, "Proposal"), (1, "Design"), (2, "Tasks"), (3, "auth")]
+        rows = wrap_viewer_header(24, tabs, 0)
+
+        self.assertGreater(len(rows), 1)  # wraps rather than clipping
+        labels = [segment.label.strip() for row in rows for segment in row]
+        self.assertEqual(labels, ["‹", "Proposal", "Design", "Tasks", "auth"])  # nothing dropped
+        # Every tab is a mouse target.
+        select = [s for row in rows for s in row if s.action == "select_tab"]
+        self.assertEqual([s.index for s in select], [0, 1, 2, 3])
+
+    def test_viewer_geometry_clips_tab_rows_in_a_short_pane(self):
+        artifacts = [Artifact("proposal", "Proposal", Path("/tmp/p.md"))] + [
+            Artifact(f"doc:d{i}.md", f"Doc {i}", Path(f"/tmp/d{i}.md")) for i in range(10)
+        ]
+        sidebar = self.make_sidebar(artifacts)
+        width, height = 24, 9
+        all_rows = wrap_viewer_header(width, viewer_tab_items(artifacts), 0)
+        geo = sidebar.viewer_geometry(height, width, sidebar.change, artifacts[0])
+
+        self.assertLess(len(geo["header_rows"]), len(all_rows))  # some tab rows omitted
+        self.assertEqual(geo["header_rows"], all_rows[: len(geo["header_rows"])])
+        self.assertGreaterEqual(geo["visible"], 1)  # content still shown
+
+    def test_viewer_header_marks_selected_spec_tab_across_rows(self):
+        tabs = [(0, "Proposal"), (1, "Design"), (2, "Tasks"), (3, "one"), (4, "two")]
+        rows = wrap_viewer_header(28, tabs, 4)
+        segments = [segment for row in rows for segment in row]
+
+        self.assertIn("two", [segment.label.strip() for segment in segments])
+        selected = next(segment for segment in segments if segment.selected)
+        self.assertEqual(selected.label, "two")
+        self.assertEqual(selected.index, 4)
+
+    def test_draw_viewer_shows_name_heading_above_marked_tabs(self):
+        proposal = Artifact("proposal", "Proposal", Path("/tmp/proposal.md"), content="proposal")
+        spec = Artifact("spec:auth/spec.md", "Spec · auth", Path("/tmp/spec.md"), content="spec")
+        sidebar = self.make_sidebar([proposal, spec])
+        sidebar.viewer = proposal
+
+        with patch("sidebar.curses.color_pair", return_value=0):
+            sidebar.draw_viewer()
+        # The change name heads row 0; tabs are on the row below it.
+        self.assertTrue(any(y == 0 and sidebar.change.name in text for y, _, text, _ in sidebar.screen.writes))
+        proposal_tab = next(
+            target for target in sidebar.hit_targets
+            if target.action == "select_tab" and target.index == 0
+        )
+        self.assertEqual(proposal_tab.top, 1)
+        self.assertTrue(any(y == 1 and "Proposal" in text for y, _, text, _ in sidebar.screen.writes))
+        self.assertTrue(proposal_tab.contains(1, proposal_tab.left))
+
+        sidebar.screen.writes.clear()
+        sidebar.hit_targets = []
+        sidebar.viewer = spec
+        with patch("sidebar.curses.color_pair", return_value=0):
+            sidebar.draw_viewer()
+        spec_tab = next(
+            target for target in sidebar.hit_targets
+            if target.action == "select_tab" and target.index == 1
+        )
+        self.assertTrue(any(y == 1 and "auth" in text for y, _, text, _ in sidebar.screen.writes))
+        self.assertTrue(spec_tab.contains(1, spec_tab.left))
+
+    def test_discovers_non_standard_markdown_as_doc_artifacts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            change_dir = root / "openspec" / "changes" / "add-thing"
+            change_dir.mkdir(parents=True)
+            (change_dir / ".openspec.yaml").write_text("", encoding="utf-8")
+            (change_dir / "proposal.md").write_text("# Proposal", encoding="utf-8")
+            (change_dir / "tasks.md").write_text("- [ ] 1.1 do it", encoding="utf-8")
+            (change_dir / "research.md").write_text("# Research", encoding="utf-8")
+            specs = change_dir / "specs" / "auth"
+            specs.mkdir(parents=True)
+            (specs / "spec.md").write_text("## ADDED Requirements", encoding="utf-8")
+
+            change = discover_changes(root)[0]
+            keys = [artifact.key for artifact in change.artifacts]
+
+            self.assertIn("doc:research.md", keys)
+            self.assertGreater(keys.index("doc:research.md"), keys.index("tasks"))
+            self.assertLess(
+                keys.index("doc:research.md"),
+                min(index for index, key in enumerate(keys) if key.startswith("spec:")),
+            )
+            doc = next(a for a in change.artifacts if a.key == "doc:research.md")
+            self.assertEqual(doc.title, "Research")
+
+    def test_doc_artifact_title_prettifies_the_file_name(self):
+        self.assertEqual(doc_artifact_title("research.md"), "Research")
+        self.assertEqual(doc_artifact_title("release-notes.md"), "Release Notes")
+        self.assertEqual(doc_artifact_title("open_questions.md"), "Open Questions")
+
+    def test_viewer_tab_items_order_core_then_docs_then_specs(self):
+        artifacts = [
+            Artifact("proposal", "Proposal", Path("/tmp/p.md")),
+            Artifact("tasks", "Tasks", Path("/tmp/t.md")),
+            Artifact("doc:research.md", "Research", Path("/tmp/r.md")),
+            Artifact("spec:auth/spec.md", "Spec · auth", Path("/tmp/s.md")),
+        ]
+        self.assertEqual(
+            [label for _index, label in viewer_tab_items(artifacts)],
+            ["Proposal", "Tasks", "Research", "auth"],
+        )
+
+    def test_tab_group_pair_classifies_by_key(self):
+        self.assertEqual(tab_group_pair("proposal"), TAB_PAIR_STANDARD)
+        self.assertEqual(tab_group_pair("tasks"), TAB_PAIR_STANDARD)
+        self.assertEqual(tab_group_pair("doc:research.md"), TAB_PAIR_DOC)
+        self.assertEqual(tab_group_pair("spec:auth/spec.md"), TAB_PAIR_SPEC)
+        self.assertEqual(tab_group_pair("specs"), TAB_PAIR_SPEC)
+
+    def test_draw_viewer_color_codes_tab_groups(self):
+        artifacts = [
+            Artifact("proposal", "Proposal", Path("/tmp/p.md"), content="p"),
+            Artifact("design", "Design", Path("/tmp/d.md"), content="d"),
+            Artifact("doc:research.md", "Research", Path("/tmp/r.md"), content="r"),
+            Artifact("spec:auth/spec.md", "Spec · auth", Path("/tmp/s.md"), content="s"),
+        ]
+        sidebar = self.make_sidebar(artifacts)
+        sidebar.viewer = artifacts[0]  # Proposal selected
+
+        def color_pair(pair):
+            return pair * 0x100
+
+        with patch("sidebar.curses.color_pair", side_effect=color_pair):
+            sidebar.draw_viewer()
+
+        def style_of(label):
+            return next(st for y, _x, text, st in sidebar.screen.writes if text == label and y >= 1)
+
+        self.assertEqual(style_of("Design"), color_pair(TAB_PAIR_STANDARD))
+        self.assertEqual(style_of("Research"), color_pair(TAB_PAIR_DOC))
+        self.assertEqual(style_of("auth"), color_pair(TAB_PAIR_SPEC))
+        self.assertEqual(style_of("Proposal"), curses.A_REVERSE | curses.A_BOLD)
+
+    def test_viewer_footer_advertises_document_shortcuts(self):
+        sidebar = self.make_sidebar([Artifact("proposal", "Proposal", Path("/tmp/p.md"), content="p")])
+        sidebar.viewer = sidebar.change.artifacts[0]
+
+        with patch("sidebar.curses.color_pair", return_value=0):
+            sidebar.draw_viewer()
+
+        labels = {text for _y, _x, text, _st in sidebar.screen.writes}
+        self.assertIn("p/d/t/s docs", labels)
+        self.assertIn("e folder", labels)
+        self.assertIn("← back", labels)
+
+    def test_tab_click_opens_existing_and_reports_missing_without_closing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            proposal_path = Path(temporary) / "proposal.md"
+            design_path = Path(temporary) / "design.md"
+            proposal_path.write_text("proposal", encoding="utf-8")
+            design_path.write_text("design", encoding="utf-8")
+            proposal = Artifact("proposal", "Proposal", proposal_path, content="proposal")
+            design = Artifact("design", "Design", design_path, content="design")
+            missing_design = Artifact("design", "Design", None)
+            spec = Artifact(
+                "spec:auth/spec.md",
+                "Spec · auth",
+                Path(temporary) / "spec.md",
+                content="spec",
+            )
+            (Path(temporary) / "spec.md").write_text("spec", encoding="utf-8")
+            sidebar = self.make_sidebar([proposal, design, spec])
+            sidebar.viewer = proposal
+
+            sidebar.dispatch_action("select_tab", 1)
+            self.assertIs(sidebar.viewer, design)
+            self.assertEqual(sidebar.artifact_index, 1)
+
+            sidebar.changes[0].artifacts[1] = missing_design
+            sidebar.viewer = proposal
+            sidebar.artifact_index = 0
+            sidebar.dispatch_action("select_tab", 1)
+            self.assertIs(sidebar.viewer, proposal)
+            self.assertEqual(sidebar.artifact_index, 1)
+            self.assertEqual(sidebar.message, "Artifact does not exist yet")
+
+            sidebar.artifact_index = 0
+            sidebar.viewer = proposal
+            sidebar.dispatch_action("select_tab", 2)
+            self.assertIs(sidebar.viewer, spec)
+
+            sidebar.viewer_offset = 4
+            sidebar.dispatch_action("select_tab", 2)
+            self.assertIs(sidebar.viewer, spec)
+            self.assertEqual(sidebar.viewer_offset, 4)
+
+    def test_viewer_shortcuts_switch_documents_and_ignore_artifact_list(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            proposal_path = Path(temporary) / "proposal.md"
+            design_path = Path(temporary) / "design.md"
+            proposal_path.write_text("proposal", encoding="utf-8")
+            design_path.write_text("design", encoding="utf-8")
+            proposal = Artifact("proposal", "Proposal", proposal_path, content="proposal")
+            design = Artifact("design", "Design", design_path, content="design")
+            missing = Artifact("design", "Design", None)
+            sidebar = self.make_sidebar([proposal, design])
+            sidebar.viewer = proposal
+
+            sidebar.handle(ord("d"))
+            self.assertIs(sidebar.viewer, design)
+
+            sidebar.changes[0].artifacts[1] = missing
+            sidebar.viewer = proposal
+            sidebar.artifact_index = 0
+            sidebar.handle(ord("d"))
+            self.assertIs(sidebar.viewer, proposal)
+            self.assertEqual(sidebar.message, "Artifact does not exist yet")
+
+            sidebar.viewer = None
+            sidebar.focus = "artifacts"
+            sidebar.artifact_index = 1
+            sidebar.handle(ord("p"))
+            self.assertEqual(sidebar.artifact_index, 1)
+            self.assertIsNone(sidebar.viewer)
+
+    def test_s_opens_and_cycles_specifications(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            first_path = Path(temporary) / "one.md"
+            second_path = Path(temporary) / "two.md"
+            first_path.write_text("one", encoding="utf-8")
+            second_path.write_text("two", encoding="utf-8")
+            proposal = Artifact("proposal", "Proposal", Path(temporary) / "proposal.md", content="p")
+            first = Artifact("spec:one/spec.md", "Spec · one", first_path, content="one")
+            second = Artifact("spec:two/spec.md", "Spec · two", second_path, content="two")
+            sidebar = self.make_sidebar([proposal, first, second])
+            sidebar.focus = "changes"
+
+            sidebar.handle(ord("s"))
+            self.assertIs(sidebar.viewer, first)
+
+            sidebar.handle(ord("s"))
+            self.assertIs(sidebar.viewer, second)
+            sidebar.handle(ord("s"))
+            self.assertIs(sidebar.viewer, first)
+
+            sidebar.viewer_offset = 2
+            sidebar.handle(ord("s"))
+            self.assertIs(sidebar.viewer, second)
+            only = self.make_sidebar([proposal, first])
+            only.viewer = first
+            only.viewer_offset = 3
+            only.handle(ord("s"))
+            self.assertIs(only.viewer, first)
+            self.assertEqual(only.viewer_offset, 3)
+
+            empty = self.make_sidebar([proposal, Artifact("specs", "Specifications", None)])
+            empty.viewer = proposal
+            empty.handle(ord("s"))
+            self.assertIs(empty.viewer, proposal)
+            self.assertEqual(empty.message, "Artifact does not exist yet")
+
+    def test_arrow_keys_switch_viewer_tabs_and_back_from_proposal(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = {
+                name: Path(temporary) / f"{name}.md"
+                for name in ("proposal", "design", "tasks", "one", "two")
+            }
+            for path in paths.values():
+                path.write_text(path.stem, encoding="utf-8")
+            proposal = Artifact("proposal", "Proposal", paths["proposal"], content="proposal")
+            design = Artifact("design", "Design", paths["design"], content="design")
+            tasks = Artifact("tasks", "Tasks", paths["tasks"], content="tasks")
+            first = Artifact("spec:one/spec.md", "Spec · one", paths["one"], content="one")
+            second = Artifact("spec:two/spec.md", "Spec · two", paths["two"], content="two")
+            sidebar = self.make_sidebar([proposal, design, tasks, first, second])
+            sidebar.viewer = proposal
+
+            sidebar.handle(curses.KEY_RIGHT)
+            self.assertIs(sidebar.viewer, design)
+            sidebar.handle(curses.KEY_RIGHT)
+            self.assertIs(sidebar.viewer, tasks)
+            sidebar.handle(curses.KEY_RIGHT)
+            self.assertIs(sidebar.viewer, first)
+            sidebar.handle(curses.KEY_RIGHT)
+            self.assertIs(sidebar.viewer, second)
+            sidebar.handle(curses.KEY_RIGHT)
+            self.assertIs(sidebar.viewer, second)
+
+            sidebar.handle(curses.KEY_LEFT)
+            self.assertIs(sidebar.viewer, first)
+            sidebar.handle(curses.KEY_LEFT)
+            self.assertIs(sidebar.viewer, tasks)
+
+            sidebar.viewer = proposal
+            sidebar.handle(curses.KEY_LEFT)
+            self.assertIsNone(sidebar.viewer)
 
     def test_footer_layout_omits_clipped_hints_and_their_targets(self):
         actions = [("↵ open", "open"), ("v validate", "validate"), ("q close", "close")]
@@ -689,24 +1056,25 @@ class SidebarModelTests(unittest.TestCase):
             ["open", "validate", "close"],
         )
 
-    def test_artifact_heading_shows_total_without_changing_row_targets(self):
-        artifacts = [
-            Artifact("proposal", "Proposal", Path("/tmp/proposal.md")),
-            Artifact("design", "Design", None, required=False),
-            Artifact("tasks", "Tasks", None),
-            Artifact("spec:one/spec.md", "Spec · one", Path("/tmp/spec.md")),
-            Artifact("spec:two/spec.md", "Spec · two", Path("/tmp/spec-two.md")),
+    def test_draw_main_renders_a_card_and_select_target_per_change(self):
+        sidebar = self.make_sidebar()
+        sidebar.changes = [
+            Change("alpha", Path("/tmp/alpha"), goal="First change", tasks_done=0, tasks_total=3),
+            Change("beta", Path("/tmp/beta"), goal="Second change"),
         ]
-        sidebar = self.make_sidebar(artifacts)
+        sidebar.change_index = 0
 
         with patch("sidebar.curses.color_pair", return_value=0):
             sidebar.draw_main()
 
-        self.assertTrue(
-            any(text == "ARTIFACTS (5)" for _, _, text, _ in sidebar.screen.writes)
-        )
-        targets = [target for target in sidebar.hit_targets if target.action == "open_artifact"]
-        self.assertEqual([target.index for target in targets], list(range(5)))
+        texts = [text for _, _, text, _ in sidebar.screen.writes]
+        self.assertTrue(any("alpha" in text for text in texts))  # name line
+        self.assertTrue(any("Artifacts · 0/3" in text for text in texts))  # status line
+        self.assertTrue(any("First change" in text for text in texts))  # description line
+        select_targets = [t for t in sidebar.hit_targets if t.action == "select_change"]
+        self.assertEqual(sorted(t.index for t in select_targets), [0, 1])
+        # The main-view artifact list is gone.
+        self.assertEqual([t for t in sidebar.hit_targets if t.action == "open_artifact"], [])
 
     def test_viewer_scrolls_by_one_line_and_one_visible_page(self):
         sidebar = self.make_sidebar()
@@ -729,8 +1097,10 @@ class SidebarModelTests(unittest.TestCase):
         self.assertEqual(clamp_document_offset(500, 100, 25), 75)
         self.assertEqual(clamp_document_offset(10, 3, 25), 0)
 
-        wrapped = wrap_document("one\ntwo\nthree", 40)
-        self.assertEqual(wrapped, ["one", "two", "three"])
+        rendered = render_markdown("one\ntwo\nthree", 40)
+        self.assertEqual(
+            rendered, [[("one", 0, 0)], [("two", 0, 0)], [("three", 0, 0)]]
+        )
 
     def test_viewer_arrow_and_page_keys_use_distinct_scroll_paths(self):
         sidebar = self.make_sidebar()
@@ -787,59 +1157,54 @@ class SidebarModelTests(unittest.TestCase):
         self.assertEqual(mouse_wheel_direction(0), 0)
         sidebar.scroll_viewer_lines.assert_not_called()
 
-    def test_layout_shows_fifteen_changes_in_a_tall_pane(self):
-        layout = calculate_main_layout(40, 25, 12, 6, 0, 2)
+    def test_layout_fills_height_with_no_fixed_card_cap(self):
+        # A very tall pane shows more than 15 cards when enough changes exist.
+        layout = calculate_main_layout(90, 30, 12)
 
-        self.assertEqual(layout.changes.count, 15)
-        self.assertEqual(layout.artifacts.count, 6)
-        self.assertEqual(layout.goal_count, 2)
-        self.assertLess(layout.artifact_row + layout.artifacts.count, layout.summary_row + 1)
+        self.assertEqual(layout.card_rows, CARD_ROWS)
+        self.assertGreater(layout.changes.count, 15)
+        self.assertEqual(layout.changes.count, (90 - 1 - 1 - 4) // CARD_ROWS)
+        self.assertLessEqual(
+            layout.change_row + layout.changes.count * layout.card_rows, layout.message_row
+        )
 
-    def test_layout_uses_surplus_height_for_more_than_four_artifacts(self):
-        layout = calculate_main_layout(46, 25, 12, 12, 10, 2)
+    def test_layout_fits_whole_cards_within_the_available_height(self):
+        layout = calculate_main_layout(30, 25, 0)
 
-        self.assertEqual(layout.changes.count, 15)
-        self.assertGreater(layout.artifacts.count, 4)
-        self.assertLessEqual(layout.artifacts.start, 10)
-        self.assertGreater(layout.artifacts.stop, 10)
-        self.assertLessEqual(layout.artifact_row + layout.artifacts.count, layout.summary_row)
+        self.assertEqual(layout.changes.count, (30 - 6) // CARD_ROWS)
+        self.assertLessEqual(
+            layout.change_row + layout.changes.count * layout.card_rows, layout.message_row
+        )
 
-    def test_layout_reduces_change_rows_in_a_medium_pane(self):
-        layout = calculate_main_layout(24, 25, 12, 6, 0, 2)
+    def test_layout_reduces_cards_in_a_medium_pane(self):
+        layout = calculate_main_layout(30, 25, 12)
 
         self.assertGreater(layout.changes.count, 1)
         self.assertLess(layout.changes.count, 15)
-        self.assertEqual(layout.artifacts.count, 4)
-        self.assertLessEqual(layout.artifact_row + layout.artifacts.count, layout.summary_row)
+        self.assertEqual(layout.changes.count, (30 - 6) // CARD_ROWS)
 
-    def test_layout_degrades_to_one_change_and_artifact_at_minimum_height(self):
-        layout = calculate_main_layout(12, 25, 12, 6, 3, 2)
+    def test_layout_shows_one_card_at_minimum_height(self):
+        layout = calculate_main_layout(12, 25, 12)
 
         self.assertEqual(layout.changes.count, 1)
-        self.assertEqual(layout.artifacts.count, 1)
-        self.assertEqual(layout.goal_count, 0)
-        self.assertLess(layout.status_row, layout.artifact_header_row)
-        self.assertLess(layout.artifact_row, layout.summary_row)
+        self.assertLess(layout.change_row, layout.message_row)
+        self.assertLess(layout.message_row, layout.footer_row)
 
     def test_layout_keeps_change_selection_visible_across_the_list(self):
-        beginning = calculate_main_layout(24, 25, 0, 6, 0, 2).changes
-        middle = calculate_main_layout(24, 25, 12, 6, 0, 2).changes
-        end = calculate_main_layout(24, 25, 24, 6, 0, 2).changes
+        beginning = calculate_main_layout(30, 25, 0).changes
+        middle = calculate_main_layout(30, 25, 12).changes
+        end = calculate_main_layout(30, 25, 24).changes
 
         self.assertEqual(beginning.start, 0)
         self.assertLessEqual(middle.start, 12)
         self.assertGreater(middle.stop, 12)
         self.assertEqual(end.stop, 25)
 
-    def test_layout_keeps_artifact_selection_visible_across_the_list(self):
-        beginning = calculate_main_layout(30, 10, 0, 12, 0, 1).artifacts
-        middle = calculate_main_layout(30, 10, 0, 12, 6, 1).artifacts
-        end = calculate_main_layout(30, 10, 0, 12, 11, 1).artifacts
+    def test_layout_scrolls_a_lower_selection_into_view(self):
+        window = calculate_main_layout(30, 25, 20).changes
 
-        self.assertEqual(beginning.start, 0)
-        self.assertLessEqual(middle.start, 6)
-        self.assertGreater(middle.stop, 6)
-        self.assertEqual(end.stop, 12)
+        self.assertLessEqual(window.start, 20)
+        self.assertGreater(window.stop, 20)
 
     def test_finds_project_from_nested_directory(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -880,46 +1245,48 @@ class SidebarModelTests(unittest.TestCase):
 """
         self.assertEqual(delta_counts([content]), {"ADDED": 2, "REMOVED": 1})
 
-    def test_formats_populated_and_empty_task_counts(self):
-        populated = Change("add-login", Path("/tmp/add-login"), tasks_done=3, tasks_total=5)
+    def test_card_status_shows_status_artifacts_and_progress(self):
+        populated = Change(
+            "add-login",
+            Path("/tmp/add-login"),
+            tasks_done=0,
+            tasks_total=16,
+            artifacts=[Artifact("proposal", "Proposal", None)] * 4,
+        )
+        self.assertEqual(
+            format_card_status(populated, 40), f"{populated.status} · 4 Artifacts · 0/16"
+        )
+
         empty = Change("add-logout", Path("/tmp/add-logout"))
+        self.assertEqual(format_card_status(empty, 40), "READY · 0 Artifacts · 0/0")
 
-        populated_row = format_change_row(populated, 24)
-        empty_row = format_change_row(empty, 24)
-
-        self.assertEqual(len(populated_row), 24)
-        self.assertTrue(populated_row.endswith("3/5"))
-        self.assertIn("add-login", populated_row)
-        self.assertTrue(empty_row.endswith("0/0"))
-
-    def test_change_rows_show_independent_selection_and_worktree_markers(self):
+    def test_card_name_marks_selection_and_drops_worktree_glyph(self):
         untouched = Change("untouched", Path("/tmp/untouched"))
         touched = Change("touched", Path("/tmp/touched"), worktree_touched=True)
 
-        self.assertTrue(format_change_row(untouched, 24).startswith("   "))
-        self.assertTrue(format_change_row(untouched, 24, selected=True).startswith("›  "))
-        self.assertTrue(format_change_row(touched, 24).startswith(" ◆ "))
-        self.assertTrue(format_change_row(touched, 24, selected=True).startswith("›◆ "))
+        self.assertTrue(format_card_name(untouched, 24).startswith("  "))
+        self.assertTrue(format_card_name(untouched, 24, selected=True).startswith("› "))
+        # Worktree-touched changes are indicated by color, not a glyph.
+        self.assertNotIn("◆", format_card_name(touched, 24))
+        self.assertNotIn("◆", format_card_name(touched, 24, selected=True))
+        self.assertIn("touched", format_card_name(touched, 24))
 
-    def test_touched_rows_preserve_task_count_at_long_and_minimum_widths(self):
+    def test_card_status_reserves_progress_when_narrow(self):
         change = Change(
-            "a-very-long-worktree-change",
+            "c",
             Path("/tmp/change"),
             tasks_done=12,
             tasks_total=123,
-            worktree_touched=True,
+            artifacts=[Artifact("proposal", "Proposal", None)] * 4,
         )
+        full = format_card_status(change, 60)
+        self.assertTrue(full.endswith("12/123"))
+        narrow = format_card_status(change, 16)
+        self.assertLessEqual(len(narrow), 16)
+        self.assertTrue(narrow.endswith("12/123"))  # complete progress preserved
+        self.assertIn("…", narrow)  # other status-line content trimmed first
 
-        normal = format_change_row(change, 24, selected=True)
-        minimum = format_change_row(change, 8, selected=True)
-
-        self.assertEqual(len(normal), 24)
-        self.assertTrue(normal.startswith("›◆ "))
-        self.assertIn("…", normal)
-        self.assertTrue(normal.endswith("12/123"))
-        self.assertEqual(minimum, "›◆12/123")
-
-    def test_draw_main_accents_every_touched_row_and_preserves_selection_and_hits(self):
+    def test_draw_main_colors_touched_card_names_without_a_glyph(self):
         sidebar = self.make_sidebar()
         sidebar.changes = [
             Change("first", Path("/tmp/first"), worktree_touched=True),
@@ -929,20 +1296,23 @@ class SidebarModelTests(unittest.TestCase):
         sidebar.change_index = 0
         accent = 1 << 22
 
-        with patch("sidebar.curses.color_pair", side_effect=lambda pair: accent if pair == 2 else 0):
+        with patch("sidebar.curses.color_pair", side_effect=lambda pair: accent if pair == 1 else 0):
             sidebar.draw_main()
 
-        change_writes = {
+        # Card name lines land at rows 4, 8, 12 (one per card, CARD_ROWS apart).
+        names = {
             y: (text, style)
             for y, x, text, style in sidebar.screen.writes
-            if y in (4, 5, 6) and x == 1
+            if x == 1 and y in (4, 8, 12)
         }
-        self.assertTrue(change_writes[4][0].startswith("›◆ "))
-        self.assertTrue(change_writes[4][1] & accent)
-        self.assertTrue(change_writes[4][1] & curses.A_REVERSE)
-        self.assertTrue(change_writes[5][0].startswith(" ◆ "))
-        self.assertTrue(change_writes[5][1] & accent)
-        self.assertFalse(change_writes[6][1] & accent)
+        self.assertTrue(names[4][0].startswith("› first"))
+        self.assertTrue(names[4][1] & accent)  # touched -> accent color
+        self.assertTrue(names[4][1] & curses.A_REVERSE)  # selected
+        self.assertTrue(names[8][0].startswith("  second"))
+        self.assertTrue(names[8][1] & accent)
+        self.assertFalse(names[12][1] & accent)  # untouched -> no accent
+        self.assertNotIn("◆", names[4][0])
+        self.assertNotIn("◆", names[8][0])
         self.assertEqual(
             [
                 target.index
@@ -952,37 +1322,24 @@ class SidebarModelTests(unittest.TestCase):
             [0, 1, 2],
         )
 
-    def test_truncates_name_before_task_count_at_supported_widths(self):
-        change = Change(
-            "a-very-long-change-name",
-            Path("/tmp/a-very-long-change-name"),
-            tasks_done=12,
-            tasks_total=123,
-        )
+    def test_card_name_truncates_long_names(self):
+        change = Change("a-very-long-change-name", Path("/tmp/a-very-long-change-name"))
 
-        normal_row = format_change_row(change, 24, selected=True)
-        minimum_row = format_change_row(change, 16, selected=True)
+        wide = format_card_name(change, 40)
+        narrow = format_card_name(change, 12)
 
-        self.assertEqual(len(normal_row), 24)
-        self.assertEqual(len(minimum_row), 16)
-        self.assertTrue(normal_row.startswith("› "))
-        self.assertIn("…", minimum_row)
-        self.assertTrue(normal_row.endswith("12/123"))
-        self.assertTrue(minimum_row.endswith("12/123"))
+        self.assertIn("a-very-long-change-name", wide)
+        self.assertLessEqual(len(narrow), 12)
+        self.assertIn("…", narrow)
+        self.assertTrue(narrow.startswith("  "))
 
-    def test_rows_keep_counts_associated_with_their_changes(self):
-        changes = [
-            Change("add-login", Path("/tmp/add-login"), tasks_done=1, tasks_total=4),
-            Change("add-logout", Path("/tmp/add-logout"), tasks_done=2, tasks_total=2),
-        ]
+    def test_each_card_reflects_its_own_counts(self):
+        first = Change("add-login", Path("/tmp/add-login"), tasks_done=1, tasks_total=4)
+        second = Change("add-logout", Path("/tmp/add-logout"), tasks_done=2, tasks_total=2)
 
-        rows = [format_change_row(change, 24, index == 1) for index, change in enumerate(changes)]
-
-        self.assertIn("add-login", rows[0])
-        self.assertTrue(rows[0].endswith("1/4"))
-        self.assertIn("add-logout", rows[1])
-        self.assertTrue(rows[1].startswith("› "))
-        self.assertTrue(rows[1].endswith("2/2"))
+        self.assertTrue(format_card_status(first, 40).endswith("1/4"))
+        self.assertTrue(format_card_status(second, 40).endswith("2/2"))
+        self.assertTrue(format_card_name(second, 24, selected=True).startswith("› "))
 
     def test_delta_summary_does_not_include_task_progress(self):
         change = Change(
@@ -1391,6 +1748,111 @@ class NestedOpenspecDiscoveryTests(unittest.TestCase):
         sidebar.openspec_projects = openspec_projects
         sidebar.changes = []
         return sidebar
+
+
+class MarkdownRenderingTests(unittest.TestCase):
+    def all_text(self, lines):
+        return "".join(text for line in lines for text, _a, _p in line)
+
+    def leading_spaces(self, line):
+        return len(line[0][0]) - len(line[0][0].lstrip(" ")) if line and line[0][0] else 0
+
+    def test_parser_returns_ast_of_heading_then_paragraph(self):
+        ast = create_markdown(renderer=None)("# H\n\ntext")
+        types = [node["type"] for node in ast if node["type"] != "blank_line"]
+        self.assertEqual(types, ["heading", "paragraph"])
+        self.assertEqual(ast[0]["attrs"]["level"], 1)
+
+    def test_visible_and_line_width_count_columns(self):
+        self.assertEqual(visible_width("hello"), 5)
+        self.assertEqual(line_width([("ab", curses.A_BOLD, 0), ("cde", 0, PAIR_CODE)]), 5)
+
+    def test_wrap_spans_preserves_style_and_hangs_indent(self):
+        spans = [("aaaa", curses.A_BOLD, 0), ("bbbb", curses.A_BOLD, 0), ("cccc", curses.A_BOLD, 0)]
+        lines = wrap_spans(spans, 9, subsequent_indent=2)
+        self.assertEqual(len(lines), 2)
+        # The wrapped bold word keeps its attribute across the line break.
+        self.assertIn(("cccc", curses.A_BOLD, 0), lines[1])
+        # Continuation is indented under the text, not the margin.
+        self.assertEqual(lines[1][0], ("  ", 0, 0))
+
+    def test_emphasis_attr_falls_back_to_underline(self):
+        self.assertEqual(emphasis_attr(True), curses.A_ITALIC)
+        self.assertEqual(emphasis_attr(False), curses.A_UNDERLINE)
+
+    def test_render_inline_styles_spans_without_markers_or_url(self):
+        para = create_markdown(renderer=None)("Use **bold** and `code` and [label](http://x).")
+        spans = render_inline(para[0]["children"], italic=curses.A_UNDERLINE)
+        self.assertIn(("bold", curses.A_BOLD, 0), spans)
+        self.assertIn(("code", 0, PAIR_CODE), spans)
+        self.assertIn(("label", curses.A_UNDERLINE, PAIR_LINK), spans)
+        joined = "".join(text for text, _a, _p in spans)
+        for marker in ("*", "`", "[", "]", "(", "http"):
+            self.assertNotIn(marker, joined)
+
+    def test_headings_are_colored_by_level_and_keep_case(self):
+        first = render_markdown("# Title Case", 80)[0]
+        second = render_markdown("## Title Case", 80)[0]
+        self.assertEqual(first[0], ("Title", curses.A_BOLD, HEADING_PAIRS[1]))
+        self.assertEqual(second[0][2], HEADING_PAIRS[2])
+        self.assertNotEqual(HEADING_PAIRS[1], HEADING_PAIRS[2])
+        # Original case is preserved (not force-uppercased).
+        self.assertIn("Title Case", self.all_text([first]))
+
+    def test_lists_nest_and_wrap_with_hanging_indent(self):
+        doc = "- alpha beta gamma delta epsilon zeta\n  - nested\n- last"
+        lines = render_markdown(doc, 20)
+        rendered = [self.all_text([line]) for line in lines]
+        # First item starts with a bullet marker.
+        self.assertTrue(rendered[0].lstrip().startswith("•"))
+        # A wrapped continuation line is indented and carries no marker.
+        continuation = next(
+            line
+            for line in lines
+            if "epsilon" in self.all_text([line])
+            and not self.all_text([line]).lstrip().startswith("•")
+        )
+        self.assertGreater(self.leading_spaces(continuation), 0)
+        # The nested item is indented deeper than a top-level item.
+        top = next(line for line in lines if self.all_text([line]).lstrip().startswith("• alpha"))
+        nested = next(line for line in lines if "nested" in self.all_text([line]))
+        self.assertGreater(self.leading_spaces(nested), self.leading_spaces(top))
+
+    def test_fenced_code_preserves_indent_and_drops_fences(self):
+        lines = render_markdown("```python\ndef f():\n    return 1\n```", 40)
+        text = [self.all_text([line]) for line in lines]
+        self.assertIn("def f():", text)
+        self.assertIn("    return 1", text)  # indentation preserved, not reflowed
+        self.assertFalse(any("```" in line for line in text))
+        self.assertTrue(all(span[2] == PAIR_CODE for line in lines for span in line))
+
+    def test_narrow_table_renders_aligned_columns(self):
+        doc = "| Name | Qty |\n| --- | --- |\n| Apples | 3 |\n| Pears | 12 |"
+        lines = render_markdown(doc, 40)
+        texts = [self.all_text([line]) for line in lines if self.all_text([line]).strip()]
+        borders = [t for t in texts if t.startswith("+")]
+        body = [t for t in texts if t.startswith("│")]
+        # Header, header/body divider, and closing border are all present.
+        self.assertEqual(len(borders), 3)
+        # Every grid row is the same width, so the columns line up.
+        self.assertEqual(len({len(t) for t in borders + body}), 1)
+        # The column separator sits at the same offset in every body row.
+        self.assertEqual(len({t.index("│", 1) for t in body}), 1)
+
+    def test_wide_table_shrinks_to_fit_without_dropping_text(self):
+        doc = (
+            "| Item | Description |\n"
+            "| --- | --- |\n"
+            "| Widget | a long description that must wrap across several lines |"
+        )
+        width = 30
+        lines = render_markdown(doc, width)
+        # Every rendered line fits the content width (width - 4).
+        self.assertTrue(all(line_width(line) <= width - 4 for line in lines))
+        # No cell word is dropped.
+        joined = self.all_text(lines)
+        for word in ("Widget", "description", "wrap", "across", "several", "lines"):
+            self.assertIn(word, joined)
 
 
 if __name__ == "__main__":

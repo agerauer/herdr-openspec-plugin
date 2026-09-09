@@ -16,6 +16,19 @@ import textwrap
 import time
 from typing import Any, Callable
 
+# Vendored, pure-Python Markdown parser (see vendor/README.md). Bundled in-tree
+# so the plugin keeps its zero-install-dependency launch (`python3 sidebar.py`);
+# parsing is not hand-rolled, while the AST-to-terminal rendering lives below.
+_VENDOR_DIR = Path(__file__).resolve().parent / "vendor"
+if _VENDOR_DIR.is_dir() and str(_VENDOR_DIR) not in sys.path:
+    sys.path.insert(0, str(_VENDOR_DIR))
+import mistune  # noqa: E402  (imported after the vendor path bootstrap above)
+from mistune.plugins.table import table as _mistune_table_plugin  # noqa: E402
+
+# AST mode: calling the parser returns a nested list of token dicts, not HTML.
+create_markdown = mistune.create_markdown
+_MARKDOWN_PARSER = create_markdown(renderer=None, plugins=[_mistune_table_plugin])
+
 
 CHECKBOX = re.compile(r"^\s*[-*]\s+\[([ xX])\]\s+", re.MULTILINE)
 HEADING = re.compile(r"^#{1,6}\s+(.*)$")
@@ -35,6 +48,18 @@ SKIPPED_DIRECTORY_NAMES = frozenset(
         "coverage",
     }
 )
+VIEWER_CORE_TABS = (
+    ("proposal", "Proposal"),
+    ("design", "Design"),
+    ("tasks", "Tasks"),
+)
+STANDARD_ARTIFACT_FILES = frozenset({"proposal.md", "design.md", "tasks.md"})
+# Tab color groups (curses pair numbers, initialized in curses_main): the three
+# standard artifacts, the non-standard change documents, and the specifications.
+TAB_PAIR_STANDARD = 1  # cyan
+TAB_PAIR_DOC = 3  # yellow
+TAB_PAIR_SPEC = 2  # green
+VIEWER_BACK_LABEL = " ‹ "
 # ncurses reserves six bits per button. Some Python builds expose button 4
 # constants but omit button 5 even though getmouse() still returns these bits.
 NCURSES_BUTTON5_RELEASED = 1 << 24
@@ -103,17 +128,11 @@ class ListWindow:
 
 @dataclass(frozen=True)
 class MainLayout:
-    """Rows and list windows used to render the sidebar's main view."""
+    """Rows and the change-card window used to render the sidebar's main view."""
 
     changes: ListWindow
     change_row: int
-    status_row: int
-    goal_row: int
-    goal_count: int
-    artifact_header_row: int
-    artifacts: ListWindow
-    artifact_row: int
-    summary_row: int
+    card_rows: int
     message_row: int
     footer_row: int
 
@@ -139,6 +158,18 @@ class FooterSegment:
     action: str
     left: int
     right: int
+
+
+@dataclass(frozen=True)
+class ViewerHeaderSegment:
+    """A complete back control or artifact tab on the document-viewer title row."""
+
+    label: str
+    action: str
+    left: int
+    right: int
+    selected: bool = False
+    index: int | None = None
 
 
 @dataclass(frozen=True)
@@ -437,6 +468,149 @@ def visible_footer_segments(
     return segments
 
 
+def wrap_footer_segments(
+    screen_width: int,
+    actions: list[tuple[str, str]],
+    left: int = 1,
+) -> list[list[FooterSegment]]:
+    """Lay out footer hints across as many rows as the width needs.
+
+    Unlike visible_footer_segments, hints that do not fit the current row wrap
+    onto the next row instead of being dropped, so the full shortcut set stays
+    visible in a narrow pane.
+    """
+    limit = max(0, screen_width - 1)
+    rows: list[list[FooterSegment]] = []
+    current: list[FooterSegment] = []
+    cursor = left
+    for label, action in actions:
+        right = cursor + len(label)
+        if right > limit and current:
+            rows.append(current)
+            current = []
+            cursor = left
+            right = cursor + len(label)
+        current.append(FooterSegment(label, action, cursor, right))
+        cursor = right + 2
+    if current:
+        rows.append(current)
+    return rows
+
+
+def spec_tab_label(artifact: Artifact) -> str:
+    """Return a short tab label for a specification artifact."""
+    prefix = "Spec · "
+    if artifact.title.startswith(prefix):
+        return artifact.title[len(prefix):]
+    if artifact.key.startswith("spec:"):
+        relative = artifact.key[5:]
+        if relative.endswith("/spec.md"):
+            return relative[: -len("/spec.md")] or relative
+        return relative
+    return artifact.title or "Specs"
+
+
+def doc_artifact_title(filename: str) -> str:
+    """Human title for a non-standard document, derived from its file name."""
+    stem = filename[:-3] if filename.endswith(".md") else filename
+    return stem.replace("-", " ").replace("_", " ").strip().title() or filename
+
+
+def non_standard_indexes(artifacts: list[Artifact]) -> list[int]:
+    """Return model indexes of non-standard (`doc:`) documents in list order."""
+    return [index for index, artifact in enumerate(artifacts) if artifact.key.startswith("doc:")]
+
+
+def tab_group_pair(key: str) -> int:
+    """Color-pair number for a tab, chosen by its artifact group."""
+    if key.startswith("spec:") or key == "specs":
+        return TAB_PAIR_SPEC
+    if key.startswith("doc:"):
+        return TAB_PAIR_DOC
+    return TAB_PAIR_STANDARD
+
+
+def viewer_tab_items(artifacts: list[Artifact]) -> list[tuple[int, str]]:
+    """Return (artifact index, label): core tabs, then non-standard docs, then specs."""
+    items: list[tuple[int, str]] = []
+    for key, label in VIEWER_CORE_TABS:
+        index = artifact_index_by_key(artifacts, key)
+        if index is not None:
+            items.append((index, label))
+    for index in non_standard_indexes(artifacts):
+        items.append((index, artifacts[index].title))
+    spec_indexes = specification_indexes(artifacts)
+    for index in spec_indexes:
+        items.append((index, spec_tab_label(artifacts[index])))
+    if not spec_indexes:
+        specs_index = artifact_index_by_key(artifacts, "specs")
+        if specs_index is not None:
+            items.append((specs_index, "Specs"))
+    return items
+
+
+def wrap_viewer_header(
+    screen_width: int,
+    tabs: list[tuple[int, str]],
+    selected_index: int | None,
+    left: int = 1,
+) -> list[list[ViewerHeaderSegment]]:
+    """Lay out the back control plus every tab across as many rows as needed.
+
+    Tabs that do not fit the current row wrap onto the next row instead of being
+    clipped, so all tabs stay visible. The caller draws only the rows that fit
+    the header's available height.
+    """
+    limit = max(0, screen_width - 1)
+    cursor = left
+    back_right = cursor + len(VIEWER_BACK_LABEL)
+    if back_right > limit:
+        return []
+    current: list[ViewerHeaderSegment] = [
+        ViewerHeaderSegment(VIEWER_BACK_LABEL, "back", cursor, back_right)
+    ]
+    cursor = back_right + 2
+    rows: list[list[ViewerHeaderSegment]] = []
+    for artifact_index, label in tabs:
+        right = cursor + len(label)
+        if right > limit and current:
+            rows.append(current)
+            current = []
+            cursor = left
+            right = cursor + len(label)
+        current.append(
+            ViewerHeaderSegment(
+                label,
+                "select_tab",
+                cursor,
+                right,
+                artifact_index == selected_index,
+                artifact_index,
+            )
+        )
+        cursor = right + 2
+    if current:
+        rows.append(current)
+    return rows
+
+
+def specification_indexes(artifacts: list[Artifact]) -> list[int]:
+    """Return model indexes of specification documents in list order."""
+    return [index for index, artifact in enumerate(artifacts) if artifact.key.startswith("spec:")]
+
+
+def viewer_document_indexes(artifacts: list[Artifact]) -> list[int]:
+    """Return existing core documents then specifications in tab order."""
+    indexes: list[int] = []
+    for key in ("proposal", "design", "tasks"):
+        index = artifact_index_by_key(artifacts, key)
+        if index is not None and artifacts[index].exists:
+            indexes.append(index)
+    indexes.extend(index for index in non_standard_indexes(artifacts) if artifacts[index].exists)
+    indexes.extend(specification_indexes(artifacts))
+    return indexes
+
+
 def clipped_hit_target(
     top: int,
     left: int,
@@ -505,75 +679,39 @@ def centered_window(total: int, selected: int, capacity: int) -> ListWindow:
     return ListWindow(start, count)
 
 
+CARD_ROWS = 4  # name, status, description, and a blank spacer between cards
+
+
 def calculate_main_layout(
     height: int,
     change_count: int,
     selected_change: int,
-    artifact_count: int,
-    selected_artifact: int,
-    goal_line_count: int,
+    footer_rows: int = 1,
 ) -> MainLayout:
-    """Allocate non-overlapping main-view regions from the pane height.
+    """Allocate the main view as a window of fixed-height change cards.
 
-    A normal pane reserves two spacer rows, up to two goal rows, and four
-    artifact rows before assigning as many as 15 rows to changes. Any space
-    left after reaching that change target expands the artifact window. At
-    the minimum supported height (12 rows), optional spacing and goal text
-    yield so one change and one artifact remain usable.
+    Each change is a multi-line card (name, status line, description) with a
+    blank spacer, so a given height fits far fewer changes than single-line
+    rows did. As many whole cards as the height fits are shown (no fixed cap),
+    reduced to keep the message and footer rows usable; at least one card is
+    shown whenever any room remains, and the selected card stays in view.
     """
-    footer_row = max(0, height - 1)
-    message_row = max(0, height - 2)
-    summary_row = max(0, height - 4)
+    footer_rows = max(1, footer_rows)
+    footer_row = max(0, height - footer_rows)  # top row of the footer block
+    message_row = max(0, footer_row - 1)
     change_row = 4
-    content_rows = max(0, summary_row - change_row)
+    content_rows = max(0, message_row - change_row)
 
-    has_changes = change_count > 0
-    has_artifacts = artifact_count > 0
-    change_capacity = 1 if has_changes else 0
-    artifact_capacity = 1 if has_artifacts else 0
-
-    # Status and the artifact heading are the two required detail rows.
-    spare = max(0, content_rows - change_capacity - artifact_capacity - 2)
-    shown_goal_lines = min(max(0, goal_line_count), 2, spare)
-    spare -= shown_goal_lines
-
-    extra_artifacts = min(max(0, artifact_count - artifact_capacity), 3, spare)
-    artifact_capacity += extra_artifacts
-    spare -= extra_artifacts
-
-    spacer_count = min(2, spare)
-    spare -= spacer_count
-
-    extra_changes = min(max(0, change_count - change_capacity), 15 - change_capacity, spare)
-    change_capacity += extra_changes
-    spare -= extra_changes
-
-    surplus_artifacts = min(max(0, artifact_count - artifact_capacity), spare)
-    artifact_capacity += surplus_artifacts
-
+    capacity = content_rows // CARD_ROWS
+    if capacity == 0 and change_count > 0 and content_rows >= 3:
+        capacity = 1  # show one card even when its spacer would be clipped
+    change_capacity = min(max(0, capacity), change_count)
     change_window = centered_window(change_count, selected_change, change_capacity)
-    row = change_row + change_window.count
-    if spacer_count:
-        row += 1
-    status_row = row
-    goal_row = status_row + 1
-    row = goal_row + shown_goal_lines
-    if spacer_count > 1:
-        row += 1
-    artifact_header_row = row
-    artifact_row = artifact_header_row + 1
-    artifact_window = centered_window(artifact_count, selected_artifact, artifact_capacity)
 
     return MainLayout(
         changes=change_window,
         change_row=change_row,
-        status_row=status_row,
-        goal_row=goal_row,
-        goal_count=shown_goal_lines,
-        artifact_header_row=artifact_header_row,
-        artifacts=artifact_window,
-        artifact_row=artifact_row,
-        summary_row=summary_row,
+        card_rows=CARD_ROWS,
         message_row=message_row,
         footer_row=footer_row,
     )
@@ -754,32 +892,42 @@ def delta_counts(contents: list[str]) -> dict[str, int]:
     return {key: value for key, value in counts.items() if value}
 
 
-def format_change_row(change: Change, width: int, selected: bool = False) -> str:
-    """Render one fixed-width list row while keeping task progress visible."""
+def truncate(text: str, width: int) -> str:
+    """Clip text to width, marking a cut with a single ellipsis."""
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    return "…" if width == 1 else text[: width - 1] + "…"
+
+
+def format_card_name(change: Change, width: int, selected: bool = False) -> str:
+    """The first card line: a selection marker and the (possibly clipped) name."""
+    marker = "›" if selected else " "
+    prefix = f"{marker} "
+    return prefix + truncate(change.name, max(0, width - len(prefix)))
+
+
+def format_card_status(change: Change, width: int) -> str:
+    """The card status line `STATUS · N Artifacts · done/total`.
+
+    The complete task-progress value is reserved: when the line does not fit,
+    the status and artifact-count portion is shortened before the progress.
+    """
     if width <= 0:
         return ""
     progress = f"{change.tasks_done}/{change.tasks_total}"
-    if width <= len(progress):
+    artifacts = f"{len(change.artifacts)} Artifacts"
+    head = f"{change.status} · {artifacts}"
+    full = f"{head} · {progress}"
+    if len(full) <= width:
+        return full
+    tail = f" · {progress}"
+    head_budget = width - len(tail)
+    if head_budget < 1:
+        # Too narrow even for the reserved progress; keep its rightmost part.
         return progress[-width:]
-
-    selection_marker = "›" if selected else " "
-    worktree_marker = "◆" if change.worktree_touched else " "
-    prefix = f"{selection_marker}{worktree_marker} "
-    name_width = width - len(prefix) - len(progress) - 1
-    if name_width <= 0:
-        marker_width = width - len(progress)
-        if marker_width >= 2:
-            compact_markers = selection_marker + worktree_marker
-        elif marker_width == 1:
-            compact_markers = worktree_marker if change.worktree_touched else selection_marker
-        else:
-            compact_markers = ""
-        return (compact_markers + progress)[-width:]
-
-    name = change.name
-    if len(name) > name_width:
-        name = "…" if name_width == 1 else name[: name_width - 1] + "…"
-    return f"{prefix}{name:<{name_width}} {progress}"
+    return truncate(head, head_budget) + tail
 
 
 def format_delta_summary(change: Change) -> str:
@@ -817,6 +965,12 @@ def discover_project_changes(
         append("proposal", "Proposal", directory / "proposal.md")
         append("design", "Design", directory / "design.md", required=False)
         append("tasks", "Tasks", directory / "tasks.md")
+        # Non-standard artifacts: any other top-level Markdown document. Shown as
+        # tabs after the standard three and before specifications.
+        for doc_path in sorted(directory.glob("*.md")):
+            if doc_path.name in STANDARD_ARTIFACT_FILES:
+                continue
+            append(f"doc:{doc_path.name}", doc_artifact_title(doc_path.name), doc_path, required=False)
         spec_paths = sorted((directory / "specs").glob("**/*.md")) if (directory / "specs").is_dir() else []
         if spec_paths:
             for spec_path in spec_paths:
@@ -869,38 +1023,287 @@ def discover_changes(
     return sort_changes(changes, snapshot)
 
 
-def clean_markdown(markdown: str) -> list[str]:
-    lines: list[str] = []
-    in_fence = False
-    for raw in markdown.splitlines():
-        line = raw.rstrip()
-        if line.strip().startswith("```"):
-            in_fence = not in_fence
-            continue
-        heading = HEADING.match(line.strip())
-        if heading:
-            title = heading.group(1).strip()
-            lines.extend(([title.upper(), "─" * min(40, len(title))]))
-            continue
-        if not in_fence:
-            line = re.sub(r"\[([^]]+)]\([^)]+\)", r"\1", line)
-            line = re.sub(r"(?<!`)`([^`]+)`", r"\1", line)
-            line = re.sub(r"\*\*([^*]+)\*\*", r"\1", line)
-        lines.append(("  " + line) if in_fence else line)
+# --- Markdown rendering -------------------------------------------------------
+#
+# A rendered document is a list of StyledLine; each StyledLine is exactly one
+# visual row and is a list of Span = (text, attr, pair). `attr` holds curses
+# attribute bits (A_BOLD/A_ITALIC/A_UNDERLINE) - plain integers usable without a
+# screen - while `pair` is a color-pair NUMBER resolved with curses.color_pair()
+# only at draw time, because color_pair() requires an initialized screen. Keeping
+# color out of the pure layer lets the renderer be unit-tested without curses.
+
+Span = tuple  # (text: str, attr: int, pair: int)
+StyledLine = list  # list[Span]
+
+PAIR_CODE = 5
+PAIR_LINK = 6
+# Heading level -> existing color pair (1 cyan, 3 yellow, 2 green). Deeper levels
+# keep the default color and stay bold. Pairs are set up in curses_main().
+HEADING_PAIRS = {1: 1, 2: 3, 3: 2}
+BLANK_LINE: StyledLine = [("", 0, 0)]
+TABLE_MIN_COL = 3
+_BREAKS = frozenset({"softbreak", "linebreak", "break"})
+
+
+def visible_width(text: str) -> int:
+    """Columns a string occupies. len() approximates - wide glyphs are a known gap."""
+    return len(text)
+
+
+def line_width(line: StyledLine) -> int:
+    return sum(visible_width(text) for text, _attr, _pair in line)
+
+
+def _is_blank(line: StyledLine) -> bool:
+    return all((not text.strip()) and attr == 0 and pair == 0 for text, attr, pair in line)
+
+
+def emphasis_attr(supports_italic: bool) -> int:
+    """Italic when the terminal renders it; underline as a visible fallback."""
+    return curses.A_ITALIC if supports_italic else curses.A_UNDERLINE
+
+
+def render_inline(nodes, attr: int = 0, pair: int = 0, *, italic: int | None = None) -> list:
+    """Flatten mistune inline nodes into spans, OR-composing styles while descending."""
+    if italic is None:
+        italic = curses.A_ITALIC
+    spans: list = []
+    for node in nodes or []:
+        kind = node.get("type")
+        if kind == "text":
+            spans.append((node.get("raw", ""), attr, pair))
+        elif kind == "strong":
+            spans.extend(render_inline(node.get("children"), attr | curses.A_BOLD, pair, italic=italic))
+        elif kind == "emphasis":
+            spans.extend(render_inline(node.get("children"), attr | italic, pair, italic=italic))
+        elif kind == "codespan":
+            spans.append((node.get("raw", ""), attr, PAIR_CODE))
+        elif kind == "link":
+            spans.extend(render_inline(node.get("children"), attr | curses.A_UNDERLINE, PAIR_LINK, italic=italic))
+        elif kind in _BREAKS:
+            spans.append((" ", attr, pair))
+        elif node.get("children"):
+            spans.extend(render_inline(node.get("children"), attr, pair, italic=italic))
+        elif "raw" in node:
+            spans.append((node["raw"], attr, pair))
+    return spans
+
+
+def wrap_spans(spans, width: int, subsequent_indent: int = 0) -> list:
+    """Word-wrap spans on visible columns, keeping each word's style and giving
+    continuation lines a hanging indent."""
+    width = max(1, width)
+    words = [(word, attr, pair) for text, attr, pair in spans for word in text.split()]
+    if not words:
+        return [list(BLANK_LINE)]
+    lines: list = []
+    current: list = []
+    current_width = 0
+    for word, attr, pair in words:
+        word_width = visible_width(word)
+        gap = 1 if current else 0
+        if current and current_width + gap + word_width > width:
+            lines.append(current)
+            current = []
+            current_width = 0
+            if subsequent_indent:
+                current.append((" " * subsequent_indent, 0, 0))
+                current_width = subsequent_indent
+            gap = 0
+        if gap:
+            current.append((" ", 0, 0))
+            current_width += 1
+        current.append((word, attr, pair))
+        current_width += word_width
+    lines.append(current)
     return lines
 
 
-def wrap_document(markdown: str, screen_width: int) -> list[str]:
-    """Wrap cleaned Markdown into the visual lines used by the viewer."""
-    wrapped: list[str] = []
-    for line in clean_markdown(markdown):
-        if not line:
-            wrapped.append("")
+def _collapse_blank_lines(lines: list) -> list:
+    """Drop leading, trailing, and repeated blank separators."""
+    out: list = []
+    for line in lines:
+        if _is_blank(line):
+            if out and not _is_blank(out[-1]):
+                out.append(list(BLANK_LINE))
         else:
-            wrapped.extend(
-                textwrap.wrap(line, max(8, screen_width - 4), replace_whitespace=False) or [""]
-            )
-    return wrapped
+            out.append(line)
+    while out and _is_blank(out[-1]):
+        out.pop()
+    return out
+
+
+def _render_paragraph(children, width, out, italic, attr=0, pair=0) -> None:
+    segments: list = [[]]
+    for node in children or []:
+        if node.get("type") in _BREAKS:
+            segments.append([])
+        else:
+            segments[-1].append(node)
+    for segment in segments:
+        out.extend(wrap_spans(render_inline(segment, attr, pair, italic=italic), width))
+
+
+def _render_heading(token, width, out, italic) -> None:
+    level = token.get("attrs", {}).get("level", 1)
+    pair = HEADING_PAIRS.get(level, 0)
+    spans = render_inline(token.get("children"), curses.A_BOLD, pair, italic=italic)
+    out.extend(wrap_spans(spans, width))
+    rule = min(40, max(1, min(width, line_width(spans))))
+    out.append([("─" * rule, curses.A_DIM, pair)])
+
+
+def _render_code(raw, out) -> None:
+    for code_line in (raw.rstrip("\n").split("\n") if raw else [""]):
+        out.append([(code_line, 0, PAIR_CODE)])
+
+
+def _render_quote(token, width, out, italic) -> None:
+    inner: list = []
+    _render_blocks(token.get("children"), max(1, width - 2), inner, italic)
+    for line in _collapse_blank_lines(inner):
+        out.append([("│ ", curses.A_DIM, 0), *line])
+
+
+def _render_list(token, width, out, italic, base_indent) -> None:
+    ordered = token.get("attrs", {}).get("ordered", False)
+    number = token.get("attrs", {}).get("start", 1) or 1
+    for item in token.get("children") or []:
+        if item.get("type") != "list_item":
+            continue
+        marker = f"{number}." if ordered else "•"
+        number += 1
+        prefix = " " * base_indent + marker + " "
+        cont = len(prefix)
+        text_width = max(1, width - cont)
+        first = True
+        for child in item.get("children") or []:
+            ckind = child.get("type")
+            if ckind in ("block_text", "paragraph"):
+                item_lines: list = []
+                _render_paragraph(child.get("children"), text_width, item_lines, italic)
+                for index, line in enumerate(item_lines):
+                    lead = prefix if (first and index == 0) else " " * cont
+                    out.append([(lead, 0, 0), *line])
+                first = False
+            elif ckind == "list":
+                _render_list(child, width, out, italic, cont)
+            elif ckind == "block_code":
+                block: list = []
+                _render_code(child.get("raw", ""), block)
+                for line in block:
+                    out.append([(" " * cont, 0, 0), *line])
+            else:
+                block = []
+                _render_blocks([child], text_width, block, italic)
+                for line in _collapse_blank_lines(block):
+                    out.append([(" " * cont, 0, 0), *line])
+                first = False
+
+
+def _render_table(token, width, out, italic) -> None:
+    header: list = []
+    rows: list = []
+    for section in token.get("children") or []:
+        stype = section.get("type")
+        if stype == "table_head":
+            header = [render_inline(c.get("children"), italic=italic) for c in section.get("children") or []]
+        elif stype == "table_body":
+            for row in section.get("children") or []:
+                rows.append([render_inline(c.get("children"), italic=italic) for c in row.get("children") or []])
+    ncols = max([len(header)] + [len(r) for r in rows])
+    if not ncols:
+        return
+
+    def pad(cells):
+        return list(cells) + [[] for _ in range(ncols - len(cells))]
+
+    header = pad(header)
+    rows = [pad(r) for r in rows]
+    widths = [1] * ncols
+    for cells in [header] + rows:
+        for i, cell in enumerate(cells):
+            widths[i] = max(widths[i], line_width(cell))
+
+    def grid_width(ws):
+        return sum(ws) + 3 * ncols + 1
+
+    # Chosen overflow policy: shrink the widest column until the grid fits, then
+    # wrap cell text. No column shrinks below TABLE_MIN_COL, so cells wrap rather
+    # than vanish and no content is dropped (see design.md).
+    while grid_width(widths) > width and any(w > TABLE_MIN_COL for w in widths):
+        widest = max(range(ncols), key=lambda j: widths[j])
+        widths[widest] -= 1
+
+    border = [("+" + "+".join("─" * (w + 2) for w in widths) + "+", curses.A_DIM, 0)]
+    out.append(border)
+    _emit_table_row(header, widths, out, header=True)
+    out.append(border)
+    for row in rows:
+        _emit_table_row(row, widths, out, header=False)
+    out.append(border)
+
+
+def _emit_table_row(cells, widths, out, header) -> None:
+    rendered = []
+    height = 1
+    for i, cell in enumerate(cells):
+        wrapped = wrap_spans(cell, widths[i]) if cell else [list(BLANK_LINE)]
+        if header:
+            wrapped = [[(t, a | curses.A_BOLD, p) for t, a, p in line] for line in wrapped]
+        rendered.append(wrapped)
+        height = max(height, len(wrapped))
+    for k in range(height):
+        line: list = [("│", curses.A_DIM, 0)]
+        for i in range(len(widths)):
+            cell_line = rendered[i][k] if k < len(rendered[i]) else list(BLANK_LINE)
+            gap = widths[i] - line_width(cell_line)
+            line.append((" ", 0, 0))
+            line.extend(cell_line)
+            if gap > 0:
+                line.append((" " * gap, 0, 0))
+            line.append((" ", 0, 0))
+            line.append(("│", curses.A_DIM, 0))
+        out.append(line)
+
+
+def _render_blocks(tokens, width, out, italic) -> None:
+    for token in tokens or []:
+        kind = token.get("type")
+        if kind == "heading":
+            _render_heading(token, width, out, italic)
+        elif kind == "paragraph":
+            _render_paragraph(token.get("children"), width, out, italic)
+        elif kind == "block_code":
+            _render_code(token.get("raw", ""), out)
+        elif kind == "block_quote":
+            _render_quote(token, width, out, italic)
+        elif kind == "list":
+            _render_list(token, width, out, italic, 0)
+        elif kind == "thematic_break":
+            out.append([("─" * min(width, 24), curses.A_DIM, 0)])
+        elif kind == "table":
+            _render_table(token, width, out, italic)
+        elif token.get("children"):
+            _render_blocks(token.get("children"), width, out, italic)
+        else:
+            continue
+        out.append(list(BLANK_LINE))
+
+
+def render_markdown(markdown: str, width: int, *, italic: int | None = None) -> list:
+    """Render Markdown into styled visual lines that fit `width` columns.
+
+    Replaces the old plain-text clean_markdown/wrap_document pipeline. Each
+    returned StyledLine is one visual row, so the viewer's scroll offset,
+    percentage, and clamp math are unchanged.
+    """
+    if italic is None:
+        italic = curses.A_ITALIC
+    content_width = max(8, width - 4)
+    lines: list = []
+    _render_blocks(_MARKDOWN_PARSER(markdown or ""), content_width, lines, italic)
+    return _collapse_blank_lines(lines)
 
 
 def clamp_document_offset(offset: int, line_count: int, visible_lines: int) -> int:
@@ -945,6 +1348,15 @@ class Sidebar:
         self.focus = "changes"
         self.viewer: Artifact | None = None
         self.viewer_offset = 0
+        # Italic is unevenly supported; fall back to underline when the terminal
+        # has no italic capability. tigetstr needs an initialized terminal, so
+        # guard for tests that construct the Sidebar without curses.
+        try:
+            self.italic_attr = curses.A_ITALIC if curses.tigetstr("sitm") else curses.A_UNDERLINE
+        except (curses.error, TypeError, ValueError):
+            self.italic_attr = curses.A_ITALIC
+        self._render_cache_key: tuple | None = None
+        self._render_cache_lines: list = []
         self.hit_targets: list[HitTarget] = []
         self.message = ""
         self.message_until = 0.0
@@ -1041,24 +1453,104 @@ class Sidebar:
             self.say("Could not run openspec validate", 4)
 
     def edit(self) -> None:
-        if not self.viewer or not self.viewer.path:
+        """Open the selected change's folder in VS Code, from any context."""
+        change = self.change
+        if not change:
             return
-        editor = shutil.which("code") or "vi"
+        code = shutil.which("code")
+        if not code:
+            # A directory is not something vi can usefully open.
+            self.say("Install `code` on PATH to open the change folder")
+            return
         try:
             curses.endwin()
             subprocess.run(
-                [editor, str(self.viewer.path)],
-                cwd=self.change.project if self.change and self.change.project else self.project,
+                [code, str(change.path)],
+                cwd=change.project if change.project else self.project,
                 check=False,
             )
         finally:
             self.screen.refresh()
             self.reload(force=True)
 
-    def viewer_dimensions(self) -> tuple[list[str], int]:
+    def render_viewer(self, content: str, width: int) -> list:
+        """Render (and cache) the open document's styled lines for a given width."""
+        key = (content, width, self.italic_attr)
+        if key != self._render_cache_key:
+            self._render_cache_lines = render_markdown(content, width, italic=self.italic_attr)
+            self._render_cache_key = key
+        return self._render_cache_lines
+
+    def draw_styled_line(self, row: int, x: int, line: list, width: int) -> None:
+        """Draw one StyledLine span by span, advancing x and clipping at the edge."""
+        for text, attr, pair in line:
+            if x >= width - 1 or not text:
+                if x >= width - 1:
+                    break
+                continue
+            style = attr
+            if pair:
+                try:
+                    style |= curses.color_pair(pair)
+                except curses.error:
+                    pass
+            self.put(row, x, text, style)
+            x += visible_width(text)
+
+    def viewer_footer_actions(self) -> list[tuple[str, str]]:
+        return [
+            ("← back", "back"),
+            ("p/d/t/s docs", ""),
+            ("e folder", "edit"),
+            ("q close", "close"),
+        ]
+
+    def viewer_geometry(self, height: int, width: int, change: "Change", artifact: Artifact) -> dict:
+        """Rows for the viewer's variable-height header/content/footer.
+
+        The change name heads row 0; the tab bar wraps across the rows below it;
+        a separator, the scrollable content, a percentage row, and the (possibly
+        wrapped) footer follow. Both drawing and scroll math read this so the
+        offset stays correct as the header grows.
+        """
+        tabs = viewer_tab_items(change.artifacts)
+        selected_index = artifact_index_by_key(change.artifacts, artifact.key)
+        header_rows = wrap_viewer_header(width, tabs, selected_index)
+        footer_rows = max(1, len(wrap_footer_segments(width, self.viewer_footer_actions())))
+        # Reserve the name row, a separator, one content row, and the percent row.
+        max_tab_rows = max(0, height - footer_rows - 4)
+        drawn_header_rows = header_rows[:max_tab_rows]
+        content_top = 1 + len(drawn_header_rows) + 1  # name + tab rows + separator
+        footer_top = max(0, height - footer_rows)
+        percent_row = max(content_top, footer_top - 1)
+        visible = max(0, percent_row - content_top)
+        return {
+            "selected_index": selected_index,
+            "header_rows": drawn_header_rows,
+            "separator_row": 1 + len(drawn_header_rows),
+            "content_top": content_top,
+            "visible": visible,
+            "percent_row": percent_row,
+            "footer_top": footer_top,
+        }
+
+    def tab_segment_style(self, segment: ViewerHeaderSegment, change: "Change") -> int:
+        if segment.action == "back":
+            return curses.A_BOLD | curses.color_pair(TAB_PAIR_STANDARD)
+        if segment.selected:
+            return curses.A_REVERSE | curses.A_BOLD
+        key = ""
+        if segment.index is not None and 0 <= segment.index < len(change.artifacts):
+            key = change.artifacts[segment.index].key
+        return curses.color_pair(tab_group_pair(key))
+
+    def viewer_dimensions(self) -> tuple[list, int]:
         height, width = self.screen.getmaxyx()
         content = self.viewer.content if self.viewer else ""
-        return wrap_document(content, width), max(0, height - 5)
+        lines = self.render_viewer(content, width)
+        if not self.viewer or not self.change:
+            return lines, max(0, height - 5)
+        return lines, self.viewer_geometry(height, width, self.change, self.viewer)["visible"]
 
     def scroll_viewer_lines(self, amount: int) -> None:
         wrapped, visible = self.viewer_dimensions()
@@ -1078,8 +1570,9 @@ class Sidebar:
             return
         artifact = change.artifacts[self.artifact_index]
         if artifact.exists:
-            self.viewer = artifact
-            self.viewer_offset = 0
+            if self.viewer is not artifact:
+                self.viewer = artifact
+                self.viewer_offset = 0
         else:
             self.say("Artifact does not exist yet")
 
@@ -1093,6 +1586,56 @@ class Sidebar:
         self.artifact_index = index
         self.open_selected_artifact()
 
+    def open_or_cycle_specification(self) -> None:
+        change = self.change
+        if not change:
+            return
+        indexes = specification_indexes(change.artifacts)
+        if not indexes:
+            specs_index = artifact_index_by_key(change.artifacts, "specs")
+            if specs_index is not None:
+                self.artifact_index = specs_index
+            self.say("Artifact does not exist yet")
+            return
+        current = None
+        if self.viewer and self.viewer.key.startswith("spec:"):
+            current = artifact_index_by_key(change.artifacts, self.viewer.key)
+        if current in indexes:
+            if len(indexes) == 1:
+                return
+            position = indexes.index(current)
+            self.artifact_index = indexes[(position + 1) % len(indexes)]
+        else:
+            self.artifact_index = indexes[0]
+        self.open_selected_artifact()
+
+    def select_viewer_tab(self, index: int) -> None:
+        change = self.change
+        if not change or index < 0 or index >= len(change.artifacts):
+            return
+        self.artifact_index = index
+        self.open_selected_artifact()
+
+    def move_viewer_tab(self, direction: int) -> None:
+        """Move to the next or previous existing document, or back from the first."""
+        change = self.change
+        if not change or not self.viewer:
+            return
+        indexes = viewer_document_indexes(change.artifacts)
+        current = artifact_index_by_key(change.artifacts, self.viewer.key)
+        if not indexes or current not in indexes:
+            if direction < 0:
+                self.dispatch_action("viewer_back")
+            return
+        position = indexes.index(current) + direction
+        if position < 0:
+            self.dispatch_action("viewer_back")
+            return
+        if position >= len(indexes):
+            return
+        self.artifact_index = indexes[position]
+        self.open_selected_artifact()
+
     def dispatch_action(self, action: str, index: int | None = None) -> bool:
         """Run one semantic action shared by keyboard and mouse input."""
         if action == "close":
@@ -1102,7 +1645,7 @@ class Sidebar:
             self.say("Refreshed")
         elif action == "validate":
             self.validate()
-        elif action == "edit" and self.viewer:
+        elif action == "edit":
             self.edit()
         elif action == "viewer_back" and self.viewer:
             self.viewer = None
@@ -1111,22 +1654,16 @@ class Sidebar:
             self.focus = "changes"
         elif action == "back":
             return self.dispatch_action("viewer_back" if self.viewer else "focus_changes")
-        elif action == "toggle_focus" and not self.viewer and self.change:
-            self.focus = "artifacts" if self.focus == "changes" else "changes"
-        elif action == "open":
-            if self.focus == "changes" and self.change:
-                self.focus = "artifacts"
-            elif self.change and self.change.artifacts:
-                self.open_selected_artifact()
+        elif action == "open" and not self.viewer and self.change:
+            self.open_artifact_by_key("proposal")
         elif action == "select_change" and index is not None and 0 <= index < len(self.changes):
             self.change_index = index
             self.artifact_index = 0
             self.focus = "changes"
-        elif action == "open_artifact" and self.change and index is not None:
-            if 0 <= index < len(self.change.artifacts):
-                self.artifact_index = index
-                self.focus = "artifacts"
-                self.open_selected_artifact()
+        elif action == "select_tab" and index is not None:
+            self.select_viewer_tab(index)
+        elif action == "viewer_tab" and index is not None:
+            self.move_viewer_tab(index)
         return True
 
     def register_hit_target(
@@ -1158,27 +1695,26 @@ class Sidebar:
             return self.dispatch_action(target.action, target.index)
         return True
 
-    def draw_footer(self, row: int, actions: list[tuple[str, str]]) -> None:
-        """Render and register each complete footer hint independently."""
+    def draw_footer(self, top_row: int, actions: list[tuple[str, str]]) -> None:
+        """Render footer hints, wrapping onto further rows below top_row."""
         _, width = self.screen.getmaxyx()
-        for segment in visible_footer_segments(width, actions):
-            self.put(row, segment.left, segment.label, curses.A_DIM)
-            self.register_hit_target(
-                row,
-                segment.left,
-                row + 1,
-                segment.right,
-                segment.action,
-            )
+        for offset, segments in enumerate(wrap_footer_segments(width, actions)):
+            row = top_row + offset
+            for segment in segments:
+                self.put(row, segment.left, segment.label, curses.A_DIM)
+                if not segment.action:
+                    continue  # display-only legend (e.g. movement keys), not clickable
+                self.register_hit_target(
+                    row,
+                    segment.left,
+                    row + 1,
+                    segment.right,
+                    segment.action,
+                )
 
     def move(self, amount: int) -> None:
-        if self.focus == "changes":
-            self.change_index = max(0, min(len(self.changes) - 1, self.change_index + amount))
-            self.artifact_index = 0
-        elif self.change:
-            self.artifact_index = max(
-                0, min(len(self.change.artifacts) - 1, self.artifact_index + amount)
-            )
+        self.change_index = max(0, min(len(self.changes) - 1, self.change_index + amount))
+        self.artifact_index = 0
 
     def handle(self, key: int) -> bool:
         if key in (ord("q"), ord("Q")):
@@ -1195,16 +1731,17 @@ class Sidebar:
             return self.dispatch_action("refresh")
         elif key in (ord("v"), ord("V")):
             return self.dispatch_action("validate")
-        elif key == ord("e") and self.viewer:
+        elif key == ord("e"):
             return self.dispatch_action("edit")
-        elif not self.viewer and self.focus == "changes" and key in (
-            ord("p"),
-            ord("d"),
-            ord("t"),
+        elif key in (ord("p"), ord("d"), ord("t"), ord("s")) and (
+            self.viewer or self.focus == "changes"
         ):
-            self.open_artifact_by_key(
-                {ord("p"): "proposal", ord("d"): "design", ord("t"): "tasks"}[key]
-            )
+            if key == ord("s"):
+                self.open_or_cycle_specification()
+            else:
+                self.open_artifact_by_key(
+                    {ord("p"): "proposal", ord("d"): "design", ord("t"): "tasks"}[key]
+                )
         elif key in (curses.KEY_UP, ord("k")):
             if self.viewer:
                 self.scroll_viewer_lines(-1)
@@ -1228,9 +1765,13 @@ class Sidebar:
         elif key == 27:
             return self.dispatch_action("viewer_back" if self.viewer else "focus_changes")
         elif key in (curses.KEY_LEFT, ord("h")):
+            if self.viewer:
+                return self.dispatch_action("viewer_tab", -1)
             return self.dispatch_action("back")
-        elif key in (9, curses.KEY_RIGHT, ord("l")):
-            return self.dispatch_action("toggle_focus")
+        elif key in (curses.KEY_RIGHT, ord("l")):
+            if self.viewer:
+                return self.dispatch_action("viewer_tab", 1)
+            return self.dispatch_action("open")
         elif key in (10, 13, curses.KEY_ENTER):
             return self.dispatch_action("open")
         return True
@@ -1264,25 +1805,51 @@ class Sidebar:
         if not artifact or not change:
             return
         height, width = self.screen.getmaxyx()
-        header_label = f" ‹ {artifact.title} "
-        self.put(0, 1, header_label, curses.A_BOLD | curses.color_pair(1))
-        self.register_hit_target(0, 1, 1, 1 + len(header_label), "back")
-        self.put(1, 2, change.name, curses.A_DIM)
-        self.put(2, 0, "─" * max(0, width - 1), curses.A_DIM)
-        wrapped = wrap_document(artifact.content, width)
-        visible = max(0, height - 5)
+        geo = self.viewer_geometry(height, width, change, artifact)
+        # Change name heads the viewer, styled distinctly from the tabs.
+        self.put(0, 1, truncate(change.name, max(0, width - 2)), curses.A_BOLD | curses.color_pair(TAB_PAIR_STANDARD))
+        # Color-coded, wrapped tab bar beneath the name.
+        for offset, row_segments in enumerate(geo["header_rows"]):
+            row = 1 + offset
+            for segment in row_segments:
+                self.put(row, segment.left, segment.label, self.tab_segment_style(segment, change))
+                self.register_hit_target(
+                    row, segment.left, row + 1, segment.right, segment.action, segment.index
+                )
+        self.put(geo["separator_row"], 0, "─" * max(0, width - 1), curses.A_DIM)
+        wrapped = self.render_viewer(artifact.content, width)
+        visible = geo["visible"]
         max_offset = max(0, len(wrapped) - visible)
         self.viewer_offset = clamp_document_offset(self.viewer_offset, len(wrapped), visible)
-        for row, line in enumerate(wrapped[self.viewer_offset : self.viewer_offset + visible], start=3):
-            style = curses.A_BOLD if line.isupper() and line.strip("─ ") else 0
-            self.put(row, 2, line, style)
+        for row, line in enumerate(
+            wrapped[self.viewer_offset : self.viewer_offset + visible], start=geo["content_top"]
+        ):
+            self.draw_styled_line(row, 2, line, width)
         if max_offset:
-            percent = round(100 * self.viewer_offset / max_offset) if max_offset else 100
-            self.put(height - 2, max(1, width - 6), f"{percent:>3}%", curses.A_DIM)
-        self.draw_footer(
-            height - 1,
-            [("← back", "back"), ("e edit", "edit"), ("q close", "close")],
-        )
+            percent = round(100 * self.viewer_offset / max_offset)
+            self.put(geo["percent_row"], max(1, width - 6), f"{percent:>3}%", curses.A_DIM)
+        self.draw_footer(geo["footer_top"], self.viewer_footer_actions())
+
+    def draw_change_card(self, top: int, width: int, change: Change, selected: bool) -> None:
+        """Draw one change's three-line card: name, status line, description."""
+        status_color = {
+            "READY": curses.color_pair(3),
+            "INVALID": curses.color_pair(4),
+        }.get(change.status, curses.A_DIM)
+
+        name_style = curses.A_BOLD
+        if change.worktree_touched:
+            name_style |= curses.color_pair(1)
+        if selected:
+            name_style |= curses.A_REVERSE
+        self.put(top, 1, format_card_name(change, max(0, width - 2), selected), name_style)
+
+        status_line = format_card_status(change, max(0, width - 5))
+        self.put(top + 1, 4, status_line, curses.A_DIM)
+        self.put(top + 1, 4, status_line[: len(change.status)], curses.A_BOLD | status_color)
+
+        if change.goal:
+            self.put(top + 2, 4, truncate(change.goal, max(0, width - 5)), curses.A_DIM)
 
     def draw_main(self) -> None:
         height, width = self.screen.getmaxyx()
@@ -1292,75 +1859,29 @@ class Sidebar:
             self.draw_empty()
             return
 
-        change = self.change
-        assert change is not None
-        status_style = {
-            "READY": curses.color_pair(3),
-            "INVALID": curses.color_pair(4),
-        }.get(change.status, curses.A_DIM)
-        goal_lines = textwrap.wrap(change.goal, max(10, width - 4))[:2] if change.goal else []
+        footer_actions = [
+            ("↑↓ move", ""),
+            ("↵ open", "open"),
+            ("p/d/t/s docs", "open"),
+            ("e folder", "edit"),
+            ("v validate", "validate"),
+            ("r refresh", "refresh"),
+            ("q close", "close"),
+        ]
+        footer_row_count = len(wrap_footer_segments(width, footer_actions))
         layout = calculate_main_layout(
-            height,
-            len(self.changes),
-            self.change_index,
-            len(change.artifacts),
-            self.artifact_index,
-            len(goal_lines),
+            height, len(self.changes), self.change_index, footer_rows=footer_row_count
         )
         self.put(3, 1, "CHANGES", curses.A_BOLD)
-        row = layout.change_row
-        for index in range(layout.changes.start, layout.changes.stop):
+        for offset, index in enumerate(range(layout.changes.start, layout.changes.stop)):
+            top = layout.change_row + offset * layout.card_rows
             item = self.changes[index]
             selected = index == self.change_index
-            style = curses.A_REVERSE if selected and self.focus == "changes" else 0
-            if item.worktree_touched:
-                style |= curses.color_pair(2) | curses.A_BOLD
-            rendered = format_change_row(item, max(0, width - 2), selected)
-            self.put(row, 1, rendered, style | (curses.A_BOLD if selected else 0))
-            self.register_hit_target(row, 1, row + 1, 1 + len(rendered), "select_change", index)
-            row += 1
+            self.draw_change_card(top, width, item, selected)
+            self.register_hit_target(top, 1, top + 3, max(1, width), "select_change", index)
 
-        self.put(layout.status_row, 1, change.status, curses.A_BOLD | status_style)
-        for index, line in enumerate(goal_lines[: layout.goal_count]):
-            self.put(layout.goal_row + index, 2, line, curses.A_DIM)
-        self.put(
-            layout.artifact_header_row,
-            1,
-            f"ARTIFACTS ({len(change.artifacts)})",
-            curses.A_BOLD,
-        )
-
-        row = layout.artifact_row
-        for index in range(layout.artifacts.start, layout.artifacts.stop):
-            artifact = change.artifacts[index]
-            selected = index == self.artifact_index
-            if artifact.exists:
-                icon, icon_style = "•", curses.color_pair(1)
-            elif artifact.required:
-                icon, icon_style = "!", curses.color_pair(4)
-            else:
-                icon, icon_style = "·", curses.A_DIM
-            style = curses.A_REVERSE if selected and self.focus == "artifacts" else 0
-            self.put(row, 2, icon, icon_style | style)
-            self.put(row, 4, artifact.title, style | (curses.A_DIM if not artifact.exists else 0))
-            self.register_hit_target(
-                row,
-                2,
-                row + 1,
-                4 + len(artifact.title),
-                "open_artifact",
-                index,
-            )
-            row += 1
-
-        summary = format_delta_summary(change)
-        if summary and height >= 12:
-            self.put(layout.summary_row, 2, summary, curses.A_DIM)
         self.put(layout.message_row, 1, self.message if time.monotonic() < self.message_until else "", curses.A_BOLD)
-        self.draw_footer(
-            layout.footer_row,
-            [("↵ open", "open"), ("v validate", "validate"), ("q close", "close")],
-        )
+        self.draw_footer(layout.footer_row, footer_actions)
 
     def draw(self) -> None:
         self.hit_targets = []
@@ -1391,6 +1912,8 @@ def curses_main(screen) -> None:
     curses.init_pair(2, curses.COLOR_GREEN, -1)
     curses.init_pair(3, curses.COLOR_YELLOW, -1)
     curses.init_pair(4, curses.COLOR_RED, -1)
+    curses.init_pair(PAIR_CODE, curses.COLOR_MAGENTA, -1)
+    curses.init_pair(PAIR_LINK, curses.COLOR_BLUE, -1)
     try:
         curses.mousemask(curses.ALL_MOUSE_EVENTS | getattr(curses, "REPORT_MOUSE_POSITION", 0))
         curses.mouseinterval(0)
