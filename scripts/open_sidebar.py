@@ -68,10 +68,25 @@ def pane_cwd(herdr: str, pane_id: str, context: Any) -> Path:
 
 
 def openspec_project(path: Path) -> Path:
+    """Resolve the workspace search root instead of the nearest OpenSpec parent."""
+    path = path.resolve()
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+            text=True,
+            capture_output=True,
+            timeout=1.5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        completed = None
+    if completed is not None and completed.returncode == 0 and completed.stdout.strip():
+        return Path(completed.stdout.strip()).resolve()
+    found: Path | None = None
     for candidate in (path, *path.parents):
         if (candidate / "openspec").is_dir():
-            return candidate
-    return path
+            found = candidate
+    return found if found is not None else path
 
 
 def plugin_pane(value: Any, workspace_id: str, project: Path) -> str | None:
