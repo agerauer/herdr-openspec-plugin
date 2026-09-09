@@ -148,7 +148,7 @@ def socket_request(method: str, params: dict[str, Any]) -> Any:
 
 
 def resize_sidebar(herdr: str, pane_id: str) -> None:
-    """Make the new right-hand pane roughly 30% wide when layout data permits."""
+    """Give the new review pane roughly half the width when layout data permits."""
     try:
         response = socket_request("layout.export", {"pane_id": pane_id})
         tab_id = value_for(response, "tab_id")
@@ -159,8 +159,10 @@ def resize_sidebar(herdr: str, pane_id: str) -> None:
         found = split_path(root, pane_id)
         if not tab_id or not found:
             return
-        path, in_second = found
-        ratio = 0.70 if in_second is not False else 0.30
+        path, _in_second = found
+        # ratio is the first child's fraction; 0.50 splits the pane evenly
+        # whether the review pane is the first or second child.
+        ratio = 0.50
         socket_request("layout.set_split_ratio", {"tab_id": tab_id, "path": path, "ratio": ratio})
     except (OSError, RuntimeError, StopIteration, ValueError, json.JSONDecodeError):
         return

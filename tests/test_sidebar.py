@@ -50,6 +50,7 @@ from sidebar import (
     TAB_PAIR_STANDARD,
     TAB_PAIR_DOC,
     TAB_PAIR_SPEC,
+    MOUSE_MASK,
     visible_footer_segments,
     emphasis_attr,
     line_width,
@@ -423,6 +424,7 @@ class SidebarModelTests(unittest.TestCase):
         sidebar.italic_attr = curses.A_ITALIC
         sidebar._render_cache_key = None
         sidebar._render_cache_lines = []
+        sidebar.mouse_enabled = True
         sidebar.hit_targets = []
         sidebar.message = ""
         sidebar.message_until = 0.0
@@ -1142,10 +1144,10 @@ class SidebarModelTests(unittest.TestCase):
         self.assertEqual(mouse_wheel_direction(1 << 24), 1)
         self.assertEqual(mouse_wheel_direction(1 << 25), 1)
         self.assertEqual(mouse_wheel_direction(1 << 26), 1)
-        self.assertEqual(
-            mouse_wheel_direction(getattr(curses, "REPORT_MOUSE_POSITION", 0)),
-            1,
-        )
+        # Motion reporting is no longer part of the wheel mask (and no longer requested).
+        motion = getattr(curses, "REPORT_MOUSE_POSITION", 0)
+        if motion:
+            self.assertEqual(mouse_wheel_direction(motion), 0)
 
     def test_unrecognized_mouse_state_does_not_scroll_document(self):
         sidebar = self.make_sidebar()
@@ -1156,6 +1158,41 @@ class SidebarModelTests(unittest.TestCase):
 
         self.assertEqual(mouse_wheel_direction(0), 0)
         sidebar.scroll_viewer_lines.assert_not_called()
+
+    def test_pressing_m_toggles_mouse_and_reapplies_the_mask(self):
+        sidebar = self.make_sidebar()
+        calls: list[int] = []
+
+        with patch("sidebar.curses.mousemask", side_effect=lambda mask: calls.append(mask)):
+            self.assertTrue(sidebar.handle(ord("m")))
+            self.assertFalse(sidebar.mouse_enabled)  # released -> terminal can select/copy
+            self.assertTrue(sidebar.handle(ord("m")))
+            self.assertTrue(sidebar.mouse_enabled)  # restored -> in-pane mouse active
+
+        self.assertEqual(calls, [0, MOUSE_MASK])
+
+    def test_mouse_toggle_hint_appears_in_both_footers_and_reflects_state(self):
+        proposal = Artifact("proposal", "Proposal", Path("/tmp/p.md"), content="body")
+        sidebar = self.make_sidebar([proposal])
+
+        with patch("sidebar.curses.color_pair", return_value=0):
+            sidebar.draw_main()
+        self.assertIn("m mouse on", {text for _y, _x, text, _s in sidebar.screen.writes})
+
+        sidebar.screen.writes.clear()
+        sidebar.hit_targets = []
+        sidebar.viewer = proposal
+        with patch("sidebar.curses.color_pair", return_value=0):
+            sidebar.draw_viewer()
+        self.assertIn("m mouse on", {text for _y, _x, text, _s in sidebar.screen.writes})
+
+        sidebar.viewer = None
+        sidebar.mouse_enabled = False
+        sidebar.screen.writes.clear()
+        sidebar.hit_targets = []
+        with patch("sidebar.curses.color_pair", return_value=0):
+            sidebar.draw_main()
+        self.assertIn("m mouse off", {text for _y, _x, text, _s in sidebar.screen.writes})
 
     def test_layout_fills_height_with_no_fixed_card_cap(self):
         # A very tall pane shows more than 15 cards when enough changes exist.

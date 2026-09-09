@@ -54,6 +54,9 @@ VIEWER_CORE_TABS = (
     ("tasks", "Tasks"),
 )
 STANDARD_ARTIFACT_FILES = frozenset({"proposal.md", "design.md", "tasks.md"})
+# Mouse events the pane captures. Motion reporting is intentionally excluded: it
+# is unused and is the most disruptive to the terminal's own text selection.
+MOUSE_MASK = curses.ALL_MOUSE_EVENTS
 # Tab color groups (curses pair numbers, initialized in curses_main): the three
 # standard artifacts, the non-standard change documents, and the specifications.
 TAB_PAIR_STANDARD = 1  # cyan
@@ -660,7 +663,6 @@ def mouse_wheel_direction(button_state: int) -> int:
         "BUTTON5_PRESSED",
         "BUTTON5_CLICKED",
         "BUTTON4_RELEASED",
-        "REPORT_MOUSE_POSITION",
     ) | NCURSES_BUTTON5_RELEASED | NCURSES_BUTTON5_PRESSED | NCURSES_BUTTON5_CLICKED
     if button_state & wheel_up:
         return -1
@@ -1357,6 +1359,7 @@ class Sidebar:
             self.italic_attr = curses.A_ITALIC
         self._render_cache_key: tuple | None = None
         self._render_cache_lines: list = []
+        self.mouse_enabled = True
         self.hit_targets: list[HitTarget] = []
         self.message = ""
         self.message_until = 0.0
@@ -1452,6 +1455,26 @@ class Sidebar:
             change.validation_detail = str(error)
             self.say("Could not run openspec validate", 4)
 
+    def apply_mouse_mask(self) -> None:
+        """Enable or release mouse capture to match self.mouse_enabled.
+
+        Released (mask 0), the terminal's native selection/copy works over the
+        pane; enabled, in-pane clicks and wheel scrolling work.
+        """
+        try:
+            curses.mousemask(MOUSE_MASK if self.mouse_enabled else 0)
+        except curses.error:
+            pass
+
+    def toggle_mouse(self) -> None:
+        self.mouse_enabled = not self.mouse_enabled
+        self.apply_mouse_mask()
+        self.say(
+            "Mouse on — clicks and wheel active"
+            if self.mouse_enabled
+            else "Mouse off — select and copy with the terminal, press m to restore"
+        )
+
     def edit(self) -> None:
         """Open the selected change's folder in VS Code, from any context."""
         change = self.change
@@ -1497,11 +1520,15 @@ class Sidebar:
             self.put(row, x, text, style)
             x += visible_width(text)
 
+    def mouse_hint(self) -> tuple[str, str]:
+        return (f"m mouse {'on' if self.mouse_enabled else 'off'}", "toggle_mouse")
+
     def viewer_footer_actions(self) -> list[tuple[str, str]]:
         return [
             ("← back", "back"),
             ("p/d/t/s docs", ""),
             ("e folder", "edit"),
+            self.mouse_hint(),
             ("q close", "close"),
         ]
 
@@ -1647,6 +1674,8 @@ class Sidebar:
             self.validate()
         elif action == "edit":
             self.edit()
+        elif action == "toggle_mouse":
+            self.toggle_mouse()
         elif action == "viewer_back" and self.viewer:
             self.viewer = None
             self.viewer_offset = 0
@@ -1733,6 +1762,8 @@ class Sidebar:
             return self.dispatch_action("validate")
         elif key == ord("e"):
             return self.dispatch_action("edit")
+        elif key in (ord("m"), ord("M")):
+            return self.dispatch_action("toggle_mouse")
         elif key in (ord("p"), ord("d"), ord("t"), ord("s")) and (
             self.viewer or self.focus == "changes"
         ):
@@ -1866,6 +1897,7 @@ class Sidebar:
             ("e folder", "edit"),
             ("v validate", "validate"),
             ("r refresh", "refresh"),
+            self.mouse_hint(),
             ("q close", "close"),
         ]
         footer_row_count = len(wrap_footer_segments(width, footer_actions))
@@ -1906,6 +1938,13 @@ class Sidebar:
 
 def curses_main(screen) -> None:
     curses.curs_set(0)
+    # Escape is the lead byte of arrow/function-key sequences, so ncurses waits
+    # ESCDELAY (long by default) before delivering a lone Escape. Shorten it so
+    # leaving the document viewer with Escape is as prompt as Left.
+    try:
+        curses.set_escdelay(25)
+    except (curses.error, AttributeError):
+        pass
     curses.use_default_colors()
     curses.start_color()
     curses.init_pair(1, curses.COLOR_CYAN, -1)
@@ -1915,7 +1954,7 @@ def curses_main(screen) -> None:
     curses.init_pair(PAIR_CODE, curses.COLOR_MAGENTA, -1)
     curses.init_pair(PAIR_LINK, curses.COLOR_BLUE, -1)
     try:
-        curses.mousemask(curses.ALL_MOUSE_EVENTS | getattr(curses, "REPORT_MOUSE_POSITION", 0))
+        curses.mousemask(MOUSE_MASK)
         curses.mouseinterval(0)
     except curses.error:
         pass

@@ -24,7 +24,7 @@ herdr plugin link .
 herdr plugin action invoke herdr.openspec-review.open-sidebar
 ```
 
-The action uses the invoking pane's foreground directory, resolves the Git workspace (or the highest ancestor with an `openspec/` directory), and opens the review pane on the right. The pane process stays rooted in the plugin checkout while the selected workspace is passed separately, so it works from any Herdr workspace. Invoking it again focuses the existing review pane for that workspace.
+The action uses the invoking pane's foreground directory, resolves the Git workspace (or the highest ancestor with an `openspec/` directory), and opens the review pane on the right at about half the available width (you can resize it afterward). The pane process stays rooted in the plugin checkout while the selected workspace is passed separately, so it works from any Herdr workspace. Invoking it again focuses the existing review pane for that workspace.
 
 ## Worktree-aware ordering
 
@@ -62,6 +62,7 @@ Then run `herdr server reload-config`.
 | `v` | Validate the selected change with OpenSpec |
 | `e` | Open the selected change's whole folder in VS Code (requires `code` on `PATH`), from both the change list and the document viewer |
 | `r` | Refresh now (the pane also watches for changes) |
+| `m` | Toggle the pane's mouse capture; turn it off to select and copy text with the terminal (Herdr's mark-and-autocopy), on to use in-pane clicks and wheel scrolling |
 | `q` | Close the review pane |
 | Left-click a change card | Select that change |
 | Left-click the viewer's top back label | Return to the selected artifact in the main view |
