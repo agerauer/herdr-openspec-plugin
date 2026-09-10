@@ -1,41 +1,44 @@
 # OpenSpec Review for Herdr
 
-A narrow keyboard-and-mouse review pane for active [OpenSpec](https://openspec.dev/) changes. It keeps proposal, specification, design, and task review in the same terminal workspace as your coding agents.
+A focused, keyboard-and-mouse review pane for active [OpenSpec](https://openspec.dev/) changes, built as a plugin for the [Herdr](https://herdr.dev/) terminal workspace manager. It keeps proposal, spec, design, and task review one split away from the coding agents doing the work — no context switch, no browser.
 
-## What it shows
+![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
 
-- Every active change from the workspace `openspec/` tree and from OpenSpec directories at most two levels below it (for example `nxt/openspec` and `apps/nxt/openspec`)
-- Nested changes prefixed with the project path using a spaced middle dot (`nxt · add-login`); root-level changes keep their unprefixed name
-- Each change as an inline card — bold name, a `STATE · done/total · N Artifacts` line, and the change's description — shown for every change, not only the selected one
-- Up to 15 change cards in tall panes, reduced automatically to fit; the selected card stays in view as you move
-- Worktree-touched changes grouped at the top with their names shown in an accent color (the most likely one initially selected); no separate marker glyph
-- A document viewer with a color-coded tab bar — the standard artifacts (Proposal, Design, Tasks), any non-standard `.md` documents in the change folder (shown after Tasks, before specs), and one tab per specification each in their own color; the open document is marked, the tab bar wraps onto more rows when needed, and the change name heads the view above the tabs
-- `p`, `d`, `t`, and `s` switch among the standard artifacts and specs, Enter opens the Proposal, and Left/Right move through every tab including non-standard documents
-- Documents rendered as formatted Markdown: color-coded headings, **bold**, *italic*, inline and fenced code, links, nested and ordered lists with hanging indents, and pipe tables that shrink to fit the pane
-- A prominent, color-coded state on each card derived from task progress and validity — `DRAFT` (no tasks or a missing required artifact), `READY` (`0/Y`), `IN PROGRESS` (`X/Y`), `DONE` (`Y/Y`), or `INVALID` (validation failed) — followed by the toned-down `done/total` and artifact count
-- When running inside Herdr, a button at the end of each actionable card's status line that hands the change's next step to the coding agent in the pane to the left: `READY` offers **apply**, `IN PROGRESS` offers **investigate**, `DONE` offers **archive** (which also syncs specs), and `DRAFT`/`INVALID` offer nothing. The button submits `/opsx:apply`, `/opsx:archive`, or a "look at the open tasks" prompt to that agent and then focuses it; if the left pane is not an idle Claude agent, it reports why nothing was sent. Outside Herdr there is no button
-- `openspec validate` results on demand, run in the change's own OpenSpec project
+> Requires [Herdr](https://herdr.dev/) 0.8+ and the [OpenSpec](https://openspec.dev/) CLI. Pure Python — no packages to install (the Markdown parser is vendored in-tree).
 
-## Install for local development
+## Why
 
-Requirements: Herdr 0.8+, OpenSpec, and Python 3 on macOS or Linux.
+If you drive development with OpenSpec, your changes live as Markdown under `openspec/` and your agents work in terminal panes. This plugin puts a live review pane beside them: it lists every active change, shows each one's state and task progress at a glance, renders the artifacts as real Markdown, and — inside Herdr — can hand a change's next step straight to the agent in the pane next door.
+
+## Requirements
+
+- **Herdr** 0.8 or newer (`herdr --version`)
+- **OpenSpec** CLI on your `PATH` (`openspec`)
+- **Python 3.9+** (standard library only)
+- **macOS or Linux**
+- Optional: the `code` CLI, for opening a change folder in VS Code with `e`
+
+## Install
+
+Clone the repo and link it as a Herdr plugin:
 
 ```sh
+git clone https://github.com/agerauer/herdr-openspec-plugin.git
+cd herdr-openspec-plugin
 herdr plugin link .
+```
+
+Then open the review pane from any Herdr workspace:
+
+```sh
 herdr plugin action invoke herdr.openspec-review.open-sidebar
 ```
 
-The action uses the invoking pane's foreground directory, resolves the Git workspace (or the highest ancestor with an `openspec/` directory), and opens the review pane on the right at about half the available width (you can resize it afterward). The pane process stays rooted in the plugin checkout while the selected workspace is passed separately, so it works from any Herdr workspace. Invoking it again focuses the existing review pane for that workspace.
+The action reads the invoking pane's foreground directory, resolves the Git workspace (or the highest ancestor containing an `openspec/` directory), and opens the review pane on the right at about half the width — resize it however you like. Invoking it again focuses the existing pane for that workspace.
 
-## Worktree-aware ordering
+### Bind a key (recommended)
 
-When the selected workspace is in Git, the sidebar compares every discovered `openspec/changes/` tree with the merge base of the repository's default branch. It includes committed branch differences, staged and unstaged edits, and untracked files. Touched active changes appear before untouched changes and have their names shown in an accent color, regardless of which OpenSpec root they come from.
-
-Within the touched group, an exact normalized match between the unprefixed change folder name and the branch leaf or worktree directory name ranks first, followed by a match where that context name contains the complete hyphen-delimited folder name, then most recent activity and finally the displayed change name. The highest-ranked touched change is selected when the pane first opens. Refreshes preserve the current selection while it still exists.
-
-The base resolver checks the remote default branch, then `origin/main`, local `main`, `origin/master`, and local `master`. If the project is not a Git worktree or Git/base inspection fails or times out, the pane still opens with normal alphabetical ordering and no worktree markers.
-
-To bind it in `~/.config/herdr/config.toml`:
+Add a binding to `~/.config/herdr/config.toml`:
 
 ```toml
 [[keys.command]]
@@ -45,7 +48,33 @@ command = "herdr.openspec-review.open-sidebar"
 description = "Open OpenSpec review"
 ```
 
-Then run `herdr server reload-config`.
+Then reload: `herdr server reload-config`.
+
+## What you get
+
+- **Every active change as a card** — bold name, a `STATE · done/total · N Artifacts` line, and the description — for all changes at once, not just a selected one. Cards fill the pane height and the selection always stays in view.
+- **A state derived from progress and validity**, color-coded and prominent: `DRAFT` (no tasks yet, or a required artifact missing), `READY` (`0/Y`), `IN PROGRESS` (`X/Y`), `DONE` (`Y/Y`), or `INVALID` (validation failed).
+- **Markdown-rendered artifacts** — color-coded headings, **bold**, *italic*, inline and fenced code, links, nested and ordered lists with hanging indents, and pipe tables that shrink to fit the pane.
+- **A tabbed document viewer** — the standard artifacts (Proposal, Design, Tasks), any other `.md` documents in the change folder, and one tab per spec, each color-coded by group. The tab bar wraps as needed and the change name heads the view.
+- **Multi-root discovery** — changes from the workspace `openspec/` tree and from OpenSpec directories up to two levels below it (e.g. `apps/api/openspec`). Nested changes are prefixed with their project path (`api · add-login`).
+- **Worktree-aware ordering** — in a Git workspace, changes touched on your branch are grouped at the top in an accent color, and the most likely one is selected first (details below).
+- **On-demand validation** — press `v` to run `openspec validate` in the change's own project.
+- **Send the next action to your agent** — inside Herdr, a one-click hand-off to the coding agent in the pane to the left (see below).
+
+## Send the next action to your agent
+
+When the pane runs inside Herdr, each actionable card shows its single next step as a button on the status line, and the `a` key does the same for the selected change:
+
+| Card state | Button | What it sends to the agent on the left |
+| --- | --- | --- |
+| `READY` | `apply` | `/opsx:apply <change>` |
+| `IN PROGRESS` | `investigate` | a prompt asking it to look at the change's open tasks |
+| `DONE` | `archive` | `/opsx:archive <change>` |
+| `DRAFT` / `INVALID` | — | nothing |
+
+The plugin resolves the pane immediately to its left, confirms it's a coding agent that isn't mid-prompt, submits the instruction, and focuses it so you can watch and respond. If there's no such pane — or it's busy — it tells you why nothing was sent. Outside Herdr there's no button.
+
+> This hand-off targets a [Claude Code](https://claude.com/claude-code) agent running in the neighbouring pane and uses its `/opsx:*` workflow commands. Other panes are detected and reported rather than sent to.
 
 ## Controls
 
@@ -53,27 +82,45 @@ Then run `herdr server reload-config`.
 | --- | --- |
 | `↑` / `↓`, `j` / `k` | Move the change selection; scroll an open document by one wrapped line |
 | `Page Up` / `Page Down` | Scroll an open document by one visible page |
-| `→`, `l` | Open the selected change's Proposal; in the document viewer, open the next tab or next spec if any |
-| `←`, `h` | In the document viewer, open the previous tab, or return if Proposal is open |
+| `→`, `l` | Open the selected change's Proposal; in the viewer, move to the next tab or spec |
+| `←`, `h` | In the viewer, move to the previous tab, or return if Proposal is open |
 | `Esc` | Return from a document to the main view |
-| `Enter` | Open the selected change's Proposal in the document viewer |
-| `p`, `d`, `t` | Open Proposal, Design, or Tasks from the change list or switch to them in the document viewer |
-| `s` | Open the first specification from the change list; in the document viewer, stay on a single spec or rotate through specs |
-| Left-click a viewer tab | Switch to that artifact, or report that it does not exist yet |
-| `a` | Send the selected change's next action (apply / investigate / archive) to the coding agent in the pane to the left; only inside Herdr and only when the change is actionable |
+| `Enter` | Open the selected change's Proposal |
+| `p`, `d`, `t` | Open Proposal, Design, or Tasks (from the list or the viewer) |
+| `s` | Open the first specification; in the viewer, rotate through specs |
+| `a` | Send the selected change's next action to the agent in the pane to the left (inside Herdr, when actionable) |
 | `v` | Validate the selected change with OpenSpec |
-| `e` | Open the selected change's whole folder in VS Code (requires `code` on `PATH`), from both the change list and the document viewer |
+| `e` | Open the selected change's folder in VS Code (needs `code` on `PATH`) |
 | `r` | Refresh now (the pane also watches for changes) |
-| `m` | Toggle the pane's mouse capture; turn it off to select and copy text with the terminal (Herdr's mark-and-autocopy), on to use in-pane clicks and wheel scrolling |
+| `m` | Toggle the pane's mouse capture — off to select/copy text with the terminal, on for in-pane clicks and wheel scrolling |
 | `q` | Close the review pane |
 | Left-click a change card | Select that change |
-| Left-click a card's action button | Select that change and send its next action (apply / investigate / archive) to the agent in the pane to the left |
-| Left-click the viewer's top back label | Return to the selected artifact in the main view |
-| Left-click a footer hint | Run the displayed open, validate, back, edit, or close action |
-| Mouse wheel up/down | Scroll an open document by one wrapped line in either direction per event |
+| Left-click a card's action button | Select the change and send its next action to the agent on the left |
+| Left-click a viewer tab | Switch to that artifact |
+| Left-click the viewer's back label | Return to the main view |
+| Left-click a footer hint | Run the shown action |
+| Mouse wheel | Scroll an open document one wrapped line per event |
 
-## Test
+## How worktree ordering works
+
+In a Git workspace, the sidebar compares every discovered `openspec/changes/` tree against the merge base of the repository's default branch — including committed branch differences, staged and unstaged edits, and untracked files. Touched changes sort above untouched ones, in an accent color, whichever OpenSpec root they came from.
+
+Within the touched group, a change whose folder name matches the branch or worktree name ranks first, then partial name matches, then most recent activity. The top-ranked touched change is selected when the pane opens; refreshes keep your current selection while it still exists.
+
+The base is resolved from the remote default branch, then `origin/main`, local `main`, `origin/master`, and local `master`. If the project isn't a Git worktree, or Git inspection fails or times out, the pane still opens with plain alphabetical ordering and no worktree markers.
+
+## Development
+
+The plugin is a single-file curses app (`sidebar.py`) plus a small launcher (`scripts/open_sidebar.py`). It has **no runtime dependencies** — the [mistune](https://github.com/lepture/mistune) Markdown parser is vendored under `vendor/` so `python3 sidebar.py` runs against the standard library alone.
+
+Run the tests:
 
 ```sh
 python3 -m unittest discover -s tests -v
 ```
+
+## License
+
+Released under the [MIT License](LICENSE).
+
+Bundled third-party code under `vendor/` keeps its own license: **mistune** (BSD-3-Clause), noted in [`vendor/README.md`](vendor/README.md).
