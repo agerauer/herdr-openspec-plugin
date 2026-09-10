@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from hashlib import sha256
 import curses
+import json
 import os
 from pathlib import Path
 import re
@@ -945,6 +946,96 @@ def format_card_status(change: Change, width: int) -> str:
     return progress[-width:]
 
 
+# Herdr agent-handoff. The sidebar can submit the change's next action to the
+# coding agent in the pane immediately to its left (see design.md).
+AGENT_ACTION_BY_STATE = {
+    "READY": "apply",
+    "IN PROGRESS": "investigate",
+    "DONE": "archive",
+}
+
+
+def running_in_herdr(env: "os._Environ[str] | dict[str, str]") -> bool:
+    """True when this process was launched as a Herdr pane."""
+    return env.get("HERDR_ENV") == "1" and bool(env.get("HERDR_PANE_ID"))
+
+
+def agent_action_for_state(state: str) -> str | None:
+    """The single next action offered for a change in the given state, or None.
+
+    READY -> apply, IN PROGRESS -> investigate, DONE -> archive; DRAFT and
+    INVALID (and anything unknown) have no action.
+    """
+    return AGENT_ACTION_BY_STATE.get(state)
+
+
+def agent_command_for(change: Change) -> str | None:
+    """The instruction submitted to the neighbouring agent for a change's action.
+
+    apply/archive send the corresponding opsx slash command; investigate sends a
+    plain-language prompt naming the change and its task progress. The change's
+    folder name (not its prefixed display name) is used so the agent resolves it.
+    """
+    action = agent_action_for_state(change.state)
+    if action == "apply":
+        return f"/opsx:apply {change.folder_name}"
+    if action == "archive":
+        return f"/opsx:archive {change.folder_name}"
+    if action == "investigate":
+        return (
+            f"Investigate the open tasks in the OpenSpec change "
+            f"'{change.folder_name}' ({change.tasks_done}/{change.tasks_total} "
+            f"tasks complete) and tell me what is left to finish it."
+        )
+    return None
+
+
+def _first_str_value(obj: Any, key: str) -> str | None:
+    """Return the first non-empty string found at `key` anywhere in a JSON tree."""
+    if isinstance(obj, dict):
+        value = obj.get(key)
+        if isinstance(value, str) and value:
+            return value
+        for child in obj.values():
+            found = _first_str_value(child, key)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for child in obj:
+            found = _first_str_value(child, key)
+            if found:
+                return found
+    return None
+
+
+def herdr_neighbor_pane(payload: Any) -> str | None:
+    """Extract the neighbour pane id from a `herdr pane neighbor` payload.
+
+    The id is nested at ``result.neighbor.neighbor_pane_id``; search the tree so
+    the lookup is resilient to the exact envelope shape.
+    """
+    return _first_str_value(payload, "neighbor_pane_id")
+
+
+def herdr_agent_summary(payload: Any) -> tuple[str | None, str | None, str]:
+    """Return (agent kind, status, title) from a `herdr agent get` payload.
+
+    A missing/error payload (no agent) yields (None, None, "").
+    """
+    result = payload.get("result") if isinstance(payload, dict) else None
+    agent = result.get("agent") if isinstance(result, dict) else None
+    if not isinstance(agent, dict):
+        return None, None, ""
+    kind = agent.get("agent")
+    status = agent.get("agent_status")
+    title = agent.get("terminal_title_stripped") or agent.get("terminal_title") or ""
+    return (
+        kind if isinstance(kind, str) else None,
+        status if isinstance(status, str) else None,
+        title if isinstance(title, str) else "",
+    )
+
+
 def format_delta_summary(change: Change) -> str:
     labels = {"ADDED": "+", "MODIFIED": "~", "REMOVED": "−", "RENAMED": "→"}
     return "  ".join(f"{labels[key]}{count}" for key, count in change.deltas.items())
@@ -1373,6 +1464,8 @@ class Sidebar:
         self._render_cache_key: tuple | None = None
         self._render_cache_lines: list = []
         self.mouse_enabled = True
+        # Whether the agent-action buttons are offered (only inside Herdr).
+        self.in_herdr = running_in_herdr(os.environ)
         self.hit_targets: list[HitTarget] = []
         self.message = ""
         self.message_until = 0.0
@@ -1467,6 +1560,62 @@ class Sidebar:
             change.validation = "invalid"
             change.validation_detail = str(error)
             self.say("Could not run openspec validate", 4)
+
+    def _herdr_json(self, args: list[str], timeout: float = 4) -> Any:
+        """Run a `herdr` subcommand and return its parsed JSON, or None on failure."""
+        herdr = os.environ.get("HERDR_BIN_PATH", "herdr")
+        try:
+            result = subprocess.run(
+                [herdr, *args],
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        try:
+            return json.loads(result.stdout or result.stderr or "")
+        except (ValueError, TypeError):
+            return None
+
+    def send_agent_action(self, change: Change) -> None:
+        """Submit a change's next action to the coding agent in the left pane.
+
+        Resolves the immediate left neighbour, confirms it is an unblocked Claude
+        agent, and submits the action's command; reports a short message on every
+        outcome and focuses the agent after a successful send. A no-op outside
+        Herdr or for a change with no next action.
+        """
+        if not self.in_herdr:
+            return
+        command = agent_command_for(change)
+        if not command:
+            return
+        pane_id = os.environ.get("HERDR_PANE_ID")
+        if not pane_id:
+            self.say("Not running inside Herdr — nothing sent")
+            return
+        neighbor = herdr_neighbor_pane(
+            self._herdr_json(["pane", "neighbor", "--direction", "left", "--pane", pane_id])
+        )
+        if not neighbor:
+            self.say("No agent pane to the left to send to")
+            return
+        kind, status, title = herdr_agent_summary(self._herdr_json(["agent", "get", neighbor]))
+        if kind != "claude":
+            self.say("The pane to the left is not a Claude agent")
+            return
+        if status == "blocked":
+            self.say("The agent is busy — waiting on its own input")
+            return
+        response = self._herdr_json(["agent", "prompt", neighbor, command])
+        if not isinstance(response, dict) or "error" in response:
+            self.say("Could not send to the agent")
+            return
+        label = agent_action_for_state(change.state) or "action"
+        self.say(f"Sent {label} → {title}" if title else f"Sent {label} to the agent")
+        self._herdr_json(["agent", "focus", neighbor])
 
     def apply_mouse_mask(self) -> None:
         """Enable or release mouse capture to match self.mouse_enabled.
@@ -1702,6 +1851,13 @@ class Sidebar:
             self.change_index = index
             self.artifact_index = 0
             self.focus = "changes"
+        elif action == "agent_action" and not self.viewer:
+            target = index if index is not None else self.change_index
+            if 0 <= target < len(self.changes):
+                self.change_index = target
+                self.artifact_index = 0
+                self.focus = "changes"
+                self.send_agent_action(self.changes[target])
         elif action == "select_tab" and index is not None:
             self.select_viewer_tab(index)
         elif action == "viewer_tab" and index is not None:
@@ -1777,6 +1933,8 @@ class Sidebar:
             return self.dispatch_action("edit")
         elif key in (ord("m"), ord("M")):
             return self.dispatch_action("toggle_mouse")
+        elif key in (ord("a"), ord("A")) and not self.viewer:
+            return self.dispatch_action("agent_action")
         elif key in (ord("p"), ord("d"), ord("t"), ord("s")) and (
             self.viewer or self.focus == "changes"
         ):
@@ -1874,8 +2032,14 @@ class Sidebar:
             self.put(geo["percent_row"], max(1, width - 6), f"{percent:>3}%", curses.A_DIM)
         self.draw_footer(geo["footer_top"], self.viewer_footer_actions())
 
-    def draw_change_card(self, top: int, width: int, change: Change, selected: bool) -> None:
-        """Draw one change's three-line card: name, status line, description."""
+    def draw_change_card(self, top: int, width: int, change: Change, selected: bool, index: int) -> None:
+        """Draw one change's three-line card: name, status line, description.
+
+        Inside Herdr, the change's single next action is drawn as a button
+        inline after the status text (``… N Artifacts · [archive]``) and
+        registered as a hit target; its width is reserved first so the state and
+        task progress are never truncated by it.
+        """
         state = change.state
         state_color = {
             "INVALID": curses.color_pair(4),
@@ -1892,10 +2056,25 @@ class Sidebar:
             name_style |= curses.A_REVERSE
         self.put(top, 1, format_card_name(change, max(0, width - 2), selected), name_style)
 
-        status_line = format_card_status(change, max(0, width - 5))
+        action = agent_action_for_state(state) if self.in_herdr else None
+        button = f"[{action}]" if action else ""
+        separator = " · "
+        reserve = len(separator) + len(button) if button else 0
+        status_line = format_card_status(change, max(0, width - 5 - reserve))
         self.put(top + 1, 4, status_line, curses.A_DIM)
         if status_line.startswith(state):  # color the prominent leading state
             self.put(top + 1, 4, state, curses.A_BOLD | state_color)
+
+        if button and status_line:
+            # Follow the status inline: "STATE · done/total · N Artifacts · [archive]".
+            separator_x = 4 + len(status_line)
+            button_x = separator_x + len(separator)
+            if button_x + len(button) <= width - 1:
+                self.put(top + 1, separator_x, separator, curses.A_DIM)
+                self.put(top + 1, button_x, button, state_color)  # tinted, not a loud block
+                self.register_hit_target(
+                    top + 1, button_x, top + 2, button_x + len(button), "agent_action", index
+                )
 
         if change.goal:
             self.put(top + 2, 4, truncate(change.goal, max(0, width - 5)), curses.A_DIM)
@@ -1915,9 +2094,14 @@ class Sidebar:
             ("e folder", "edit"),
             ("v validate", "validate"),
             ("r refresh", "refresh"),
-            self.mouse_hint(),
-            ("q close", "close"),
         ]
+        # The selected change's next action, when inside Herdr and one exists.
+        chosen = self.changes[self.change_index] if 0 <= self.change_index < len(self.changes) else None
+        if self.in_herdr and chosen is not None:
+            chosen_action = agent_action_for_state(chosen.state)
+            if chosen_action:
+                footer_actions.append((f"a {chosen_action}", "agent_action"))
+        footer_actions.extend([self.mouse_hint(), ("q close", "close")])
         footer_row_count = len(wrap_footer_segments(width, footer_actions))
         layout = calculate_main_layout(
             height, len(self.changes), self.change_index, footer_rows=footer_row_count
@@ -1927,7 +2111,7 @@ class Sidebar:
             top = layout.change_row + offset * layout.card_rows
             item = self.changes[index]
             selected = index == self.change_index
-            self.draw_change_card(top, width, item, selected)
+            self.draw_change_card(top, width, item, selected, index)
             self.register_hit_target(top, 1, top + 3, max(1, width), "select_change", index)
 
         self.put(layout.message_row, 1, self.message if time.monotonic() < self.message_until else "", curses.A_BOLD)

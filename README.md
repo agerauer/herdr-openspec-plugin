@@ -13,6 +13,7 @@ A narrow keyboard-and-mouse review pane for active [OpenSpec](https://openspec.d
 - `p`, `d`, `t`, and `s` switch among the standard artifacts and specs, Enter opens the Proposal, and Left/Right move through every tab including non-standard documents
 - Documents rendered as formatted Markdown: color-coded headings, **bold**, *italic*, inline and fenced code, links, nested and ordered lists with hanging indents, and pipe tables that shrink to fit the pane
 - A prominent, color-coded state on each card derived from task progress and validity — `DRAFT` (no tasks or a missing required artifact), `READY` (`0/Y`), `IN PROGRESS` (`X/Y`), `DONE` (`Y/Y`), or `INVALID` (validation failed) — followed by the toned-down `done/total` and artifact count
+- When running inside Herdr, a button at the end of each actionable card's status line that hands the change's next step to the coding agent in the pane to the left: `READY` offers **apply**, `IN PROGRESS` offers **investigate**, `DONE` offers **archive** (which also syncs specs), and `DRAFT`/`INVALID` offer nothing. The button submits `/opsx:apply`, `/opsx:archive`, or a "look at the open tasks" prompt to that agent and then focuses it; if the left pane is not an idle Claude agent, it reports why nothing was sent. Outside Herdr there is no button
 - `openspec validate` results on demand, run in the change's own OpenSpec project
 
 ## Install for local development
@@ -59,12 +60,14 @@ Then run `herdr server reload-config`.
 | `p`, `d`, `t` | Open Proposal, Design, or Tasks from the change list or switch to them in the document viewer |
 | `s` | Open the first specification from the change list; in the document viewer, stay on a single spec or rotate through specs |
 | Left-click a viewer tab | Switch to that artifact, or report that it does not exist yet |
+| `a` | Send the selected change's next action (apply / investigate / archive) to the coding agent in the pane to the left; only inside Herdr and only when the change is actionable |
 | `v` | Validate the selected change with OpenSpec |
 | `e` | Open the selected change's whole folder in VS Code (requires `code` on `PATH`), from both the change list and the document viewer |
 | `r` | Refresh now (the pane also watches for changes) |
 | `m` | Toggle the pane's mouse capture; turn it off to select and copy text with the terminal (Herdr's mark-and-autocopy), on to use in-pane clicks and wheel scrolling |
 | `q` | Close the review pane |
 | Left-click a change card | Select that change |
+| Left-click a card's action button | Select that change and send its next action (apply / investigate / archive) to the agent in the pane to the left |
 | Left-click the viewer's top back label | Return to the selected artifact in the main view |
 | Left-click a footer hint | Run the displayed open, validate, back, edit, or close action |
 | Mouse wheel up/down | Scroll an open document by one wrapped line in either direction per event |

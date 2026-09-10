@@ -2,7 +2,9 @@ import tempfile
 import os
 import curses
 import subprocess
+import json
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -28,6 +30,11 @@ from sidebar import (
     find_project,
     format_card_name,
     format_card_status,
+    running_in_herdr,
+    agent_action_for_state,
+    agent_command_for,
+    herdr_neighbor_pane,
+    herdr_agent_summary,
     truncate,
     CARD_ROWS,
     format_delta_summary,
@@ -425,6 +432,7 @@ class SidebarModelTests(unittest.TestCase):
         sidebar._render_cache_key = None
         sidebar._render_cache_lines = []
         sidebar.mouse_enabled = True
+        sidebar.in_herdr = False
         sidebar.hit_targets = []
         sidebar.message = ""
         sidebar.message_until = 0.0
@@ -1419,6 +1427,317 @@ class SidebarModelTests(unittest.TestCase):
         }
         self.assertEqual(styled.get("IN PROGRESS"), curses.A_BOLD | color_pair(3))  # yellow
         self.assertEqual(styled.get("DONE"), curses.A_BOLD | color_pair(2))  # green
+
+    # --- Agent-action buttons (Herdr handoff) ------------------------------
+
+    def test_running_in_herdr_requires_env_flag_and_pane(self):
+        self.assertTrue(running_in_herdr({"HERDR_ENV": "1", "HERDR_PANE_ID": "wK:p1"}))
+        self.assertFalse(running_in_herdr({"HERDR_ENV": "1"}))  # no pane id
+        self.assertFalse(running_in_herdr({"HERDR_PANE_ID": "wK:p1"}))  # no flag
+        self.assertFalse(running_in_herdr({"HERDR_ENV": "0", "HERDR_PANE_ID": "wK:p1"}))
+        self.assertFalse(running_in_herdr({}))
+
+    def test_agent_action_maps_only_actionable_states(self):
+        self.assertEqual(agent_action_for_state("READY"), "apply")
+        self.assertEqual(agent_action_for_state("IN PROGRESS"), "investigate")
+        self.assertEqual(agent_action_for_state("DONE"), "archive")
+        self.assertIsNone(agent_action_for_state("DRAFT"))
+        self.assertIsNone(agent_action_for_state("INVALID"))
+        self.assertIsNone(agent_action_for_state("something-else"))
+
+    def test_agent_command_uses_folder_name_and_state(self):
+        ready = Change(
+            "nxt · add-login", Path("/tmp/add-login"),
+            folder_name="add-login", tasks_done=0, tasks_total=8,
+        )
+        self.assertEqual(ready.state, "READY")
+        # The unprefixed folder name is sent, not the prefixed display name.
+        self.assertEqual(agent_command_for(ready), "/opsx:apply add-login")
+
+        done = Change(
+            "add-logout", Path("/tmp/add-logout"),
+            folder_name="add-logout", tasks_done=2, tasks_total=2,
+        )
+        self.assertEqual(agent_command_for(done), "/opsx:archive add-logout")
+
+        prog = Change(
+            "add-cart", Path("/tmp/add-cart"),
+            folder_name="add-cart", tasks_done=1, tasks_total=4,
+        )
+        investigate = agent_command_for(prog)
+        self.assertTrue(investigate.startswith("Investigate the open tasks"))
+        self.assertIn("add-cart", investigate)
+        self.assertIn("1/4", investigate)
+        self.assertNotIn("/opsx:", investigate)  # investigate is a plain prompt
+
+        draft = Change("draft", Path("/tmp/draft"), folder_name="draft")  # 0/0 -> DRAFT
+        self.assertIsNone(agent_command_for(draft))
+
+    def test_herdr_payload_parsers(self):
+        # Real shape: neighbor_pane_id is nested inside result.neighbor.
+        real = {"result": {"neighbor": {
+            "direction": "left",
+            "layout": {"focused_pane_id": "wK:p13"},
+            "neighbor_pane_id": "wK:p1",
+            "pane_id": "wK:p13",
+        }, "type": "pane_neighbor"}}
+        self.assertEqual(herdr_neighbor_pane(real), "wK:p1")
+        # A flatter envelope is still handled by the recursive search.
+        self.assertEqual(herdr_neighbor_pane({"result": {"neighbor_pane_id": "wK:p0"}}), "wK:p0")
+        self.assertIsNone(herdr_neighbor_pane({"result": {"neighbor": {}}}))
+        self.assertIsNone(herdr_neighbor_pane(None))
+
+        payload = {"result": {"agent": {
+            "agent": "claude", "agent_status": "idle",
+            "terminal_title_stripped": "Claude Code",
+        }}}
+        self.assertEqual(herdr_agent_summary(payload), ("claude", "idle", "Claude Code"))
+        self.assertEqual(herdr_agent_summary({"error": {"code": "agent_not_found"}}), (None, None, ""))
+        self.assertEqual(herdr_agent_summary(None), (None, None, ""))
+
+    def _fake_herdr(self, *, neighbor="wX:p2", agent="claude", status="idle",
+                    prompt_ok=True, capture=None):
+        """A subprocess.run side_effect that answers `herdr` subcommands with JSON."""
+        def run(cmd, **kwargs):
+            argv = cmd[1:]  # drop the herdr binary
+            out = "{}"
+            if argv[:2] == ["pane", "neighbor"]:
+                # Mirror the real envelope: neighbor_pane_id nested under result.neighbor.
+                out = json.dumps({"result": {"neighbor": {
+                    "direction": "left", "neighbor_pane_id": neighbor, "pane_id": "wK:p1",
+                }, "type": "pane_neighbor"}} if neighbor else {"result": {"neighbor": {}}})
+            elif argv[:2] == ["agent", "get"]:
+                if agent is None:
+                    out = json.dumps({"error": {"code": "agent_not_found"}})
+                else:
+                    out = json.dumps({"result": {"agent": {
+                        "agent": agent, "agent_status": status,
+                        "terminal_title_stripped": "Claude Code",
+                    }}})
+            elif argv[:2] == ["agent", "prompt"]:
+                if capture is not None:
+                    capture.append(cmd)
+                out = json.dumps({"result": {"ok": True}} if prompt_ok else {"error": {"code": "agent_blocked"}})
+            elif argv[:2] == ["agent", "focus"]:
+                out = json.dumps({"result": {}})
+            return SimpleNamespace(returncode=0, stdout=out, stderr="")
+        return run
+
+    def _send(self, change, **fake):
+        prompts = []
+        env = {"HERDR_ENV": "1", "HERDR_PANE_ID": "wK:p1", "HERDR_BIN_PATH": "herdr"}
+        sidebar = self.make_sidebar()
+        sidebar.in_herdr = True
+        with patch.dict("sidebar.os.environ", env, clear=True), patch(
+            "sidebar.subprocess.run", side_effect=self._fake_herdr(capture=prompts, **fake)
+        ):
+            sidebar.send_agent_action(change)
+        return prompts, sidebar.message
+
+    def test_send_submits_correct_command_per_action(self):
+        prompts, message = self._send(
+            Change("a", Path("/tmp/a"), folder_name="a", tasks_done=0, tasks_total=8)
+        )
+        self.assertEqual(prompts[0][1:], ["agent", "prompt", "wX:p2", "/opsx:apply a"])
+        self.assertIn("Sent apply", message)
+
+        prompts, message = self._send(
+            Change("b", Path("/tmp/b"), folder_name="b", tasks_done=2, tasks_total=2)
+        )
+        self.assertEqual(prompts[0][-1], "/opsx:archive b")
+        self.assertIn("Sent archive", message)
+
+        prompts, message = self._send(
+            Change("c", Path("/tmp/c"), folder_name="c", tasks_done=1, tasks_total=4)
+        )
+        self.assertTrue(prompts[0][-1].startswith("Investigate the open tasks"))
+        self.assertIn("1/4", prompts[0][-1])
+        self.assertIn("Sent investigate", message)
+
+    def test_send_reports_and_sends_nothing_when_target_unavailable(self):
+        ready = lambda: Change("a", Path("/tmp/a"), folder_name="a", tasks_done=0, tasks_total=8)
+
+        prompts, message = self._send(ready(), neighbor=None)
+        self.assertEqual(prompts, [])
+        self.assertIn("No agent pane", message)
+
+        prompts, message = self._send(ready(), agent="bash")
+        self.assertEqual(prompts, [])
+        self.assertIn("not a Claude agent", message)
+
+        prompts, message = self._send(ready(), status="blocked")
+        self.assertEqual(prompts, [])
+        self.assertIn("busy", message)
+
+    def test_send_is_a_noop_outside_herdr(self):
+        sidebar = self.make_sidebar()
+        sidebar.in_herdr = False
+        with patch("sidebar.subprocess.run", side_effect=AssertionError("must not shell out")):
+            sidebar.send_agent_action(
+                Change("a", Path("/tmp/a"), folder_name="a", tasks_done=0, tasks_total=8)
+            )
+        self.assertEqual(sidebar.message, "")
+
+    def _herdr_main(self, changes, selected=0):
+        sidebar = self.make_sidebar()
+        sidebar.in_herdr = True
+        sidebar.changes = changes
+        sidebar.change_index = selected
+        with patch("sidebar.curses.color_pair", return_value=0):
+            sidebar.draw_main()
+        return sidebar
+
+    def test_card_button_reflects_state_only_for_actionable_changes(self):
+        sidebar = self._herdr_main([
+            Change("ready", Path("/tmp/ready"), folder_name="ready", tasks_done=0, tasks_total=8),
+            Change("prog", Path("/tmp/prog"), folder_name="prog", tasks_done=1, tasks_total=4),
+            Change("done", Path("/tmp/done"), folder_name="done", tasks_done=4, tasks_total=4),
+        ])
+        buttons = {text for _y, _x, text, _s in sidebar.screen.writes
+                   if text in ("[apply]", "[investigate]", "[archive]")}
+        self.assertEqual(buttons, {"[apply]", "[investigate]", "[archive]"})
+
+    def test_no_button_for_draft_invalid_or_outside_herdr(self):
+        inside = self._herdr_main([
+            Change("draft", Path("/tmp/draft"), folder_name="draft"),  # 0/0 -> DRAFT
+            Change("bad", Path("/tmp/bad"), folder_name="bad",
+                   tasks_done=1, tasks_total=2, validation="invalid"),
+        ])
+        self.assertFalse(any(t.action == "agent_action" for t in inside.hit_targets))
+        self.assertFalse(any(text in ("[apply]", "[investigate]", "[archive]")
+                             for _y, _x, text, _s in inside.screen.writes))
+
+        outside = self.make_sidebar()
+        outside.in_herdr = False
+        outside.changes = [Change("ready", Path("/tmp/ready"), folder_name="ready",
+                                  tasks_done=0, tasks_total=8)]
+        outside.change_index = 0
+        with patch("sidebar.curses.color_pair", return_value=0):
+            outside.draw_main()
+        self.assertFalse(any(t.action == "agent_action" for t in outside.hit_targets))
+        self.assertFalse(any(text == "[apply]" for _y, _x, text, _s in outside.screen.writes))
+
+    def test_card_button_does_not_truncate_state_and_progress(self):
+        sidebar = self._herdr_main([
+            Change("prog", Path("/tmp/prog"), folder_name="prog", tasks_done=3, tasks_total=8),
+        ])
+        # The full status text is still drawn at column 4 with the button present.
+        status = next((text for _y, x, text, _s in sidebar.screen.writes
+                       if x == 4 and text.startswith("IN PROGRESS")), None)
+        self.assertIsNotNone(status)
+        self.assertIn("3/8", status)
+        self.assertIn("[investigate]", [text for _y, _x, text, _s in sidebar.screen.writes])
+
+    def test_card_button_is_inline_after_status_and_not_reversed(self):
+        sidebar = self._herdr_main([
+            Change("done", Path("/tmp/done"), folder_name="done",
+                   tasks_done=4, tasks_total=4,
+                   artifacts=[Artifact("p", "P", None, required=False)] * 3),  # DONE, 3 Artifacts
+        ])
+        row = 5  # change_row (4) + status offset (1)
+        status = max((text for _y, x, text, _s in sidebar.screen.writes
+                      if _y == row and x == 4), key=len)
+        self.assertIn("3 Artifacts", status)
+        _y, button_x, _text, button_style = next(
+            (w for w in sidebar.screen.writes if w[2] == "[archive]")
+        )
+        # The button sits immediately after "… N Artifacts · " (inline, not right-aligned).
+        self.assertEqual(button_x, 4 + len(status) + len(" · "))
+        separators = [text for _y2, x, text, _s in sidebar.screen.writes
+                      if _y2 == row and x == 4 + len(status)]
+        self.assertIn(" · ", separators)
+        # Tinted with the state colour, without the loud reverse-video block.
+        self.assertFalse(button_style & curses.A_REVERSE)
+
+    def test_button_click_resolves_to_agent_action_over_select_change(self):
+        sidebar = self._herdr_main([
+            Change("ready", Path("/tmp/ready"), folder_name="ready", tasks_done=0, tasks_total=8),
+            Change("done", Path("/tmp/done"), folder_name="done", tasks_done=4, tasks_total=4),
+        ])
+        targets = [t for t in sidebar.hit_targets if t.action == "agent_action" and t.index is not None]
+        self.assertEqual(sorted(t.index for t in targets), [0, 1])
+        done_button = next(t for t in targets if t.index == 1)
+        hit = hit_test(sidebar.hit_targets, done_button.top, done_button.left)
+        # The button target is registered before the card's select_change target.
+        self.assertEqual((hit.action, hit.index), ("agent_action", 1))
+
+    def test_agent_action_dispatch_selects_then_sends(self):
+        sidebar = self.make_sidebar()
+        sidebar.in_herdr = True
+        sidebar.changes = [
+            Change("a", Path("/tmp/a"), folder_name="a", tasks_done=0, tasks_total=3),
+            Change("b", Path("/tmp/b"), folder_name="b", tasks_done=0, tasks_total=3),
+        ]
+        sidebar.change_index = 0
+        sent = []
+        sidebar.send_agent_action = lambda change: sent.append(change.folder_name)
+        sidebar.dispatch_action("agent_action", 1)
+        self.assertEqual(sidebar.change_index, 1)
+        self.assertEqual(sent, ["b"])
+
+    def test_a_key_triggers_selected_action_and_is_inert_in_viewer(self):
+        sidebar = self.make_sidebar()
+        sidebar.in_herdr = True
+        sidebar.changes = [Change("ready", Path("/tmp/ready"), folder_name="ready",
+                                  tasks_done=0, tasks_total=8)]
+        sidebar.change_index = 0
+        sent = []
+        sidebar.send_agent_action = lambda change: sent.append(change.folder_name)
+        self.assertTrue(sidebar.handle(ord("a")))
+        self.assertEqual(sent, ["ready"])
+
+        sidebar.viewer = Artifact("proposal", "Proposal", Path("/tmp/p.md"), content="x")
+        sent.clear()
+        sidebar.handle(ord("a"))  # `a` does nothing while a document is open
+        self.assertEqual(sent, [])
+
+    def test_agent_action_is_a_noop_for_draft_selection(self):
+        sidebar = self.make_sidebar()
+        sidebar.in_herdr = True
+        sidebar.changes = [Change("draft", Path("/tmp/draft"), folder_name="draft")]  # DRAFT
+        sidebar.change_index = 0
+        with patch("sidebar.subprocess.run", side_effect=AssertionError("no shell out")):
+            sidebar.dispatch_action("agent_action")
+        self.assertEqual(sidebar.message, "")
+
+    def test_footer_shows_selected_action_only_when_actionable_in_herdr(self):
+        sidebar = self._herdr_main([
+            Change("ready", Path("/tmp/ready"), folder_name="ready", tasks_done=0, tasks_total=8),
+            Change("draft", Path("/tmp/draft"), folder_name="draft"),
+        ], selected=0)
+        footer_texts = [text for _y, _x, text, _s in sidebar.screen.writes]
+        self.assertIn("a apply", footer_texts)
+        self.assertTrue(any(t.action == "agent_action" and t.index is None
+                            for t in sidebar.hit_targets))
+
+        # Selecting the DRAFT card removes the footer action hint.
+        draft_selected = self._herdr_main([
+            Change("draft", Path("/tmp/draft"), folder_name="draft"),
+        ], selected=0)
+        self.assertNotIn("a apply", [text for _y, _x, text, _s in draft_selected.screen.writes])
+        self.assertFalse(any(t.action == "agent_action" and t.index is None
+                             for t in draft_selected.hit_targets))
+
+        # Outside Herdr, no footer action hint at all.
+        outside = self.make_sidebar()
+        outside.in_herdr = False
+        outside.changes = [Change("ready", Path("/tmp/ready"), folder_name="ready",
+                                  tasks_done=0, tasks_total=8)]
+        with patch("sidebar.curses.color_pair", return_value=0):
+            outside.draw_main()
+        self.assertNotIn("a apply", [text for _y, _x, text, _s in outside.screen.writes])
+
+    def test_footer_action_hint_click_sends_for_selected_change(self):
+        sidebar = self._herdr_main([
+            Change("x", Path("/tmp/x"), folder_name="x", tasks_done=0, tasks_total=8),
+            Change("y", Path("/tmp/y"), folder_name="y", tasks_done=0, tasks_total=8),
+        ], selected=1)
+        footer_target = next(t for t in sidebar.hit_targets
+                             if t.action == "agent_action" and t.index is None)
+        sent = []
+        sidebar.send_agent_action = lambda change: sent.append(change.folder_name)
+        sidebar.handle_mouse(footer_target.left, footer_target.top, self.left_click())
+        self.assertEqual(sent, ["y"])  # dispatched for the selected change
 
     def test_delta_summary_does_not_include_task_progress(self):
         change = Change(
