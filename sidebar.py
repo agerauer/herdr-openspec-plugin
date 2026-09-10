@@ -116,6 +116,19 @@ class Change:
             return "DRAFT"
         return "READY"
 
+    @property
+    def state(self) -> str:
+        """State shown on the change card, derived from validity and task progress."""
+        if self.validation == "invalid":
+            return "INVALID"
+        if self.tasks_total == 0 or self.missing_required:
+            return "DRAFT"
+        if self.tasks_done == 0:
+            return "READY"
+        if self.tasks_done < self.tasks_total:
+            return "IN PROGRESS"
+        return "DONE"
+
 
 @dataclass(frozen=True)
 class ListWindow:
@@ -911,25 +924,25 @@ def format_card_name(change: Change, width: int, selected: bool = False) -> str:
 
 
 def format_card_status(change: Change, width: int) -> str:
-    """The card status line `STATUS · N Artifacts · done/total`.
+    """The card status line `STATE · done/total · N Artifacts`.
 
-    The complete task-progress value is reserved: when the line does not fit,
-    the status and artifact-count portion is shortened before the progress.
+    The prominent state and the complete task progress are reserved: when the
+    line does not fit, the artifact count is dropped first, and only at extreme
+    widths is anything before the complete `done/total` trimmed.
     """
     if width <= 0:
         return ""
     progress = f"{change.tasks_done}/{change.tasks_total}"
     artifacts = f"{len(change.artifacts)} Artifacts"
-    head = f"{change.status} · {artifacts}"
-    full = f"{head} · {progress}"
+    head = f"{change.state} · {progress}"
+    full = f"{head} · {artifacts}"
     if len(full) <= width:
         return full
-    tail = f" · {progress}"
-    head_budget = width - len(tail)
-    if head_budget < 1:
-        # Too narrow even for the reserved progress; keep its rightmost part.
-        return progress[-width:]
-    return truncate(head, head_budget) + tail
+    if len(head) <= width:
+        return head  # drop the artifact count first
+    if len(progress) <= width:
+        return head[-width:]  # keep the complete progress at the right
+    return progress[-width:]
 
 
 def format_delta_summary(change: Change) -> str:
@@ -1863,10 +1876,14 @@ class Sidebar:
 
     def draw_change_card(self, top: int, width: int, change: Change, selected: bool) -> None:
         """Draw one change's three-line card: name, status line, description."""
-        status_color = {
-            "READY": curses.color_pair(3),
+        state = change.state
+        state_color = {
             "INVALID": curses.color_pair(4),
-        }.get(change.status, curses.A_DIM)
+            "DRAFT": curses.A_DIM,
+            "READY": curses.color_pair(1),
+            "IN PROGRESS": curses.color_pair(3),
+            "DONE": curses.color_pair(2),
+        }.get(state, curses.A_DIM)
 
         name_style = curses.A_BOLD
         if change.worktree_touched:
@@ -1877,7 +1894,8 @@ class Sidebar:
 
         status_line = format_card_status(change, max(0, width - 5))
         self.put(top + 1, 4, status_line, curses.A_DIM)
-        self.put(top + 1, 4, status_line[: len(change.status)], curses.A_BOLD | status_color)
+        if status_line.startswith(state):  # color the prominent leading state
+            self.put(top + 1, 4, state, curses.A_BOLD | state_color)
 
         if change.goal:
             self.put(top + 2, 4, truncate(change.goal, max(0, width - 5)), curses.A_DIM)

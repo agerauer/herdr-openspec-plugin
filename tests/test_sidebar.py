@@ -1071,7 +1071,7 @@ class SidebarModelTests(unittest.TestCase):
 
         texts = [text for _, _, text, _ in sidebar.screen.writes]
         self.assertTrue(any("alpha" in text for text in texts))  # name line
-        self.assertTrue(any("Artifacts · 0/3" in text for text in texts))  # status line
+        self.assertTrue(any("READY · 0/3 · 0 Artifacts" in text for text in texts))  # status line
         self.assertTrue(any("First change" in text for text in texts))  # description line
         select_targets = [t for t in sidebar.hit_targets if t.action == "select_change"]
         self.assertEqual(sorted(t.index for t in select_targets), [0, 1])
@@ -1282,7 +1282,7 @@ class SidebarModelTests(unittest.TestCase):
 """
         self.assertEqual(delta_counts([content]), {"ADDED": 2, "REMOVED": 1})
 
-    def test_card_status_shows_status_artifacts_and_progress(self):
+    def test_card_status_shows_state_progress_and_artifacts(self):
         populated = Change(
             "add-login",
             Path("/tmp/add-login"),
@@ -1290,12 +1290,12 @@ class SidebarModelTests(unittest.TestCase):
             tasks_total=16,
             artifacts=[Artifact("proposal", "Proposal", None)] * 4,
         )
-        self.assertEqual(
-            format_card_status(populated, 40), f"{populated.status} · 4 Artifacts · 0/16"
-        )
+        # Required artifacts missing (openspec draft) folds into DRAFT.
+        self.assertEqual(populated.state, "DRAFT")
+        self.assertEqual(format_card_status(populated, 40), "DRAFT · 0/16 · 4 Artifacts")
 
-        empty = Change("add-logout", Path("/tmp/add-logout"))
-        self.assertEqual(format_card_status(empty, 40), "READY · 0 Artifacts · 0/0")
+        empty = Change("add-logout", Path("/tmp/add-logout"))  # 0/0 -> DRAFT
+        self.assertEqual(format_card_status(empty, 40), "DRAFT · 0/0 · 0 Artifacts")
 
     def test_card_name_marks_selection_and_drops_worktree_glyph(self):
         untouched = Change("untouched", Path("/tmp/untouched"))
@@ -1308,7 +1308,7 @@ class SidebarModelTests(unittest.TestCase):
         self.assertNotIn("◆", format_card_name(touched, 24, selected=True))
         self.assertIn("touched", format_card_name(touched, 24))
 
-    def test_card_status_reserves_progress_when_narrow(self):
+    def test_card_status_reserves_state_and_progress_when_narrow(self):
         change = Change(
             "c",
             Path("/tmp/change"),
@@ -1317,11 +1317,12 @@ class SidebarModelTests(unittest.TestCase):
             artifacts=[Artifact("proposal", "Proposal", None)] * 4,
         )
         full = format_card_status(change, 60)
-        self.assertTrue(full.endswith("12/123"))
+        self.assertEqual(full, "DRAFT · 12/123 · 4 Artifacts")
+        # Narrow: the artifact count is dropped first; state + complete progress kept.
         narrow = format_card_status(change, 16)
         self.assertLessEqual(len(narrow), 16)
-        self.assertTrue(narrow.endswith("12/123"))  # complete progress preserved
-        self.assertIn("…", narrow)  # other status-line content trimmed first
+        self.assertTrue(narrow.endswith("12/123"))
+        self.assertNotIn("Artifacts", narrow)
 
     def test_draw_main_colors_touched_card_names_without_a_glyph(self):
         sidebar = self.make_sidebar()
@@ -1374,9 +1375,50 @@ class SidebarModelTests(unittest.TestCase):
         first = Change("add-login", Path("/tmp/add-login"), tasks_done=1, tasks_total=4)
         second = Change("add-logout", Path("/tmp/add-logout"), tasks_done=2, tasks_total=2)
 
-        self.assertTrue(format_card_status(first, 40).endswith("1/4"))
-        self.assertTrue(format_card_status(second, 40).endswith("2/2"))
+        self.assertEqual(format_card_status(first, 40), "IN PROGRESS · 1/4 · 0 Artifacts")
+        self.assertEqual(format_card_status(second, 40), "DONE · 2/2 · 0 Artifacts")
         self.assertTrue(format_card_name(second, 24, selected=True).startswith("› "))
+
+    def test_change_state_derives_from_validity_and_task_progress(self):
+        def valid(done, total):
+            return Change("c", Path("/tmp/c"), tasks_done=done, tasks_total=total)
+
+        self.assertEqual(valid(0, 0).state, "DRAFT")  # no tasks
+        self.assertEqual(valid(0, 8).state, "READY")
+        self.assertEqual(valid(3, 8).state, "IN PROGRESS")
+        self.assertEqual(valid(8, 8).state, "DONE")
+        # A missing required artifact (openspec draft) folds into DRAFT despite progress.
+        openspec_draft = Change(
+            "c", Path("/tmp/c"), tasks_done=3, tasks_total=8,
+            artifacts=[Artifact("proposal", "Proposal", None)],
+        )
+        self.assertEqual(openspec_draft.state, "DRAFT")
+        # Failed validation overrides to INVALID regardless of counts.
+        invalid = Change("c", Path("/tmp/c"), tasks_done=8, tasks_total=8, validation="invalid")
+        self.assertEqual(invalid.state, "INVALID")
+
+    def test_draw_card_colors_the_derived_state(self):
+        sidebar = self.make_sidebar()
+        sidebar.changes = [
+            Change("prog", Path("/tmp/prog"), goal="g", tasks_done=3, tasks_total=8),  # IN PROGRESS
+            Change("done", Path("/tmp/done"), goal="g", tasks_done=5, tasks_total=5),  # DONE
+        ]
+        sidebar.change_index = 0
+
+        def color_pair(pair):
+            return pair * 0x100
+
+        with patch("sidebar.curses.color_pair", side_effect=color_pair):
+            sidebar.draw_main()
+
+        # The leading state word is overlaid at column 4 in its state color.
+        styled = {
+            text: style
+            for _y, x, text, style in sidebar.screen.writes
+            if x == 4 and text in ("IN PROGRESS", "DONE")
+        }
+        self.assertEqual(styled.get("IN PROGRESS"), curses.A_BOLD | color_pair(3))  # yellow
+        self.assertEqual(styled.get("DONE"), curses.A_BOLD | color_pair(2))  # green
 
     def test_delta_summary_does_not_include_task_progress(self):
         change = Change(

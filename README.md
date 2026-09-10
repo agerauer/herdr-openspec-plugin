@@ -6,13 +6,13 @@ A narrow keyboard-and-mouse review pane for active [OpenSpec](https://openspec.d
 
 - Every active change from the workspace `openspec/` tree and from OpenSpec directories at most two levels below it (for example `nxt/openspec` and `apps/nxt/openspec`)
 - Nested changes prefixed with the project path using a spaced middle dot (`nxt · add-login`); root-level changes keep their unprefixed name
-- Each change as an inline card — bold name, a `STATUS · N Artifacts · done/total` line, and the change's description — shown for every change, not only the selected one
+- Each change as an inline card — bold name, a `STATE · done/total · N Artifacts` line, and the change's description — shown for every change, not only the selected one
 - Up to 15 change cards in tall panes, reduced automatically to fit; the selected card stays in view as you move
 - Worktree-touched changes grouped at the top with their names shown in an accent color (the most likely one initially selected); no separate marker glyph
 - A document viewer with a color-coded tab bar — the standard artifacts (Proposal, Design, Tasks), any non-standard `.md` documents in the change folder (shown after Tasks, before specs), and one tab per specification each in their own color; the open document is marked, the tab bar wraps onto more rows when needed, and the change name heads the view above the tabs
 - `p`, `d`, `t`, and `s` switch among the standard artifacts and specs, Enter opens the Proposal, and Left/Right move through every tab including non-standard documents
 - Documents rendered as formatted Markdown: color-coded headings, **bold**, *italic*, inline and fenced code, links, nested and ordered lists with hanging indents, and pipe tables that shrink to fit the pane
-- Per-change status, artifact count, and `X/Y` task completion on each card's status line
+- A prominent, color-coded state on each card derived from task progress and validity — `DRAFT` (no tasks or a missing required artifact), `READY` (`0/Y`), `IN PROGRESS` (`X/Y`), `DONE` (`Y/Y`), or `INVALID` (validation failed) — followed by the toned-down `done/total` and artifact count
 - `openspec validate` results on demand, run in the change's own OpenSpec project
 
 ## Install for local development
