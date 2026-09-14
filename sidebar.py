@@ -875,6 +875,33 @@ def read_artifact(path: Path | None) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
 
 
+def viewer_file_signature(path: Path | None):
+    """Identity of the bytes an open document should show, read from disk.
+
+    Returns ``None`` when there is no file to track (a synthetic placeholder),
+    ``(path, mtime)`` for a real file, and ``(path, None)`` when the file is
+    missing or unreadable — a marker distinct from any real modification time so
+    a removal reads as a change rather than raising.
+    """
+    if path is None:
+        return None
+    try:
+        return (str(path), path.stat().st_mtime_ns)
+    except OSError:
+        return (str(path), None)
+
+
+def document_reread_needed(tracked, current) -> bool:
+    """Whether the open document must be re-read from disk.
+
+    ``tracked`` is the signature of the bytes currently loaded; ``current`` is
+    the file's signature now. They differ when the path changed, the file was
+    written (new mtime), or it was removed (mtime marked missing) — each a reason
+    to re-read.
+    """
+    return tracked != current
+
+
 def first_summary(markdown: str) -> str:
     paragraphs: list[str] = []
     current: list[str] = []
@@ -1454,6 +1481,10 @@ class Sidebar:
         self.focus = "changes"
         self.viewer: Artifact | None = None
         self.viewer_offset = 0
+        # Signature of the bytes currently loaded into the viewer, so the open
+        # document can be re-read from disk when its file changes. Reset to None
+        # on navigation to force a fresh read on the next frame.
+        self._viewer_signature: tuple | None = None
         # Italic is unevenly supported; fall back to underline when the terminal
         # has no italic capability. tigetstr needs an initialized terminal, so
         # guard for tests that construct the Sidebar without curses.
@@ -1762,6 +1793,9 @@ class Sidebar:
             if self.viewer is not artifact:
                 self.viewer = artifact
                 self.viewer_offset = 0
+                # Force a fresh disk read on the next frame, even if the new
+                # document happens to share the previous one's mtime.
+                self._viewer_signature = None
         else:
             self.say("Artifact does not exist yet")
 
@@ -1841,6 +1875,7 @@ class Sidebar:
         elif action == "viewer_back" and self.viewer:
             self.viewer = None
             self.viewer_offset = 0
+            self._viewer_signature = None
         elif action == "focus_changes" and not self.viewer:
             self.focus = "changes"
         elif action == "back":
@@ -2001,7 +2036,27 @@ class Sidebar:
         for index, line in enumerate(textwrap.wrap(help_text, max(10, width - 4))):
             self.put(5 + index, 2, line, curses.A_DIM)
 
+    def refresh_open_document(self) -> None:
+        """Keep the open document in sync with its file on disk.
+
+        Runs before each viewer render. When a document with a file path is
+        open, it stats the file and, only when the signature (path plus mtime,
+        with a missing file marked distinctly) differs from the loaded bytes,
+        re-reads it via ``read_artifact`` into the viewer's content and records
+        the new signature. A closed viewer or one without a path (the synthetic
+        ``specs`` placeholder) is a no-op; a removed file re-reads to empty
+        rather than raising. One ``stat`` per frame, one read only on a change.
+        """
+        viewer = self.viewer
+        if viewer is None or viewer.path is None:
+            return
+        signature = viewer_file_signature(viewer.path)
+        if document_reread_needed(self._viewer_signature, signature):
+            viewer.content = read_artifact(viewer.path)
+            self._viewer_signature = signature
+
     def draw_viewer(self) -> None:
+        self.refresh_open_document()
         artifact = self.viewer
         change = self.change
         if not artifact or not change:

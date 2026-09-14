@@ -56,6 +56,7 @@ Then reload: `herdr server reload-config`.
 - **A state derived from progress and validity**, color-coded and prominent: `DRAFT` (no tasks yet, or a required artifact missing), `READY` (`0/Y`), `IN PROGRESS` (`X/Y`), `DONE` (`Y/Y`), or `INVALID` (validation failed).
 - **Markdown-rendered artifacts** — color-coded headings, **bold**, *italic*, inline and fenced code, links, nested and ordered lists with hanging indents, and pipe tables that shrink to fit the pane.
 - **A tabbed document viewer** — the standard artifacts (Proposal, Design, Tasks), any other `.md` documents in the change folder, and one tab per spec, each color-coded by group. The tab bar wraps as needed and the change name heads the view.
+- **A live open document** — whichever document you have open tracks its file on disk: it re-reads on open and refreshes in place while you watch, so an artifact an agent is editing next door stays current under your eyes (your scroll position is kept). This is separate from — and faster than — the periodic change-list refresh that updates the cards.
 - **Multi-root discovery** — changes from the workspace `openspec/` tree and from OpenSpec directories up to two levels below it (e.g. `apps/api/openspec`). Nested changes are prefixed with their project path (`api · add-login`).
 - **Worktree-aware ordering** — in a Git workspace, changes touched on your branch are grouped at the top in an accent color, and the most likely one is selected first (details below).
 - **On-demand validation** — press `v` to run `openspec validate` in the change's own project.

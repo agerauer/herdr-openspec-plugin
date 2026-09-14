@@ -30,6 +30,8 @@ from sidebar import (
     find_project,
     format_card_name,
     format_card_status,
+    viewer_file_signature,
+    document_reread_needed,
     running_in_herdr,
     agent_action_for_state,
     agent_command_for,
@@ -428,6 +430,7 @@ class SidebarModelTests(unittest.TestCase):
         sidebar.focus = "changes"
         sidebar.viewer = None
         sidebar.viewer_offset = 0
+        sidebar._viewer_signature = None
         sidebar.italic_attr = curses.A_ITALIC
         sidebar._render_cache_key = None
         sidebar._render_cache_lines = []
@@ -516,23 +519,126 @@ class SidebarModelTests(unittest.TestCase):
         self.assertIsNone(sidebar.viewer)
 
     def test_click_elsewhere_in_viewer_header_preserves_document(self):
-        artifact = Artifact(
-            "proposal",
-            "Proposal",
-            Path("/tmp/proposal.md"),
-            content="\n".join(f"line {index}" for index in range(100)),
-        )
-        sidebar = self.make_sidebar([artifact])
-        sidebar.viewer = artifact
-        sidebar.viewer_offset = 3
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "proposal.md"
+            path.write_text("\n".join(f"line {index}" for index in range(100)), encoding="utf-8")
+            artifact = Artifact("proposal", "Proposal", path)
+            sidebar = self.make_sidebar([artifact])
+            sidebar.viewer = artifact
+            sidebar.viewer_offset = 3
 
+            with patch("sidebar.curses.color_pair", return_value=0):
+                sidebar.draw_viewer()
+
+            sidebar.handle_mouse(40, 0, self.left_click())
+
+            self.assertIs(sidebar.viewer, artifact)
+            self.assertEqual(sidebar.viewer_offset, 3)
+
+    def test_document_reread_needed_compares_signatures(self):
+        base = ("/tmp/proposal.md", 1000)
+        self.assertFalse(document_reread_needed(base, base))  # same signature
+        self.assertTrue(document_reread_needed(base, ("/tmp/proposal.md", 2000)))  # changed mtime
+        self.assertTrue(document_reread_needed(base, ("/tmp/proposal.md", None)))  # file gone
+        self.assertTrue(document_reread_needed(base, ("/tmp/design.md", 1000)))  # different path
+
+    def test_viewer_file_signature_marks_missing_and_absent_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "proposal.md"
+            path.write_text("body", encoding="utf-8")
+            signature = viewer_file_signature(path)
+            self.assertEqual(signature, (str(path), path.stat().st_mtime_ns))
+
+            path.unlink()
+            self.assertEqual(viewer_file_signature(path), (str(path), None))  # missing, distinct
+            self.assertIsNone(viewer_file_signature(None))  # no file to track
+
+    def _draw(self, sidebar):
         with patch("sidebar.curses.color_pair", return_value=0):
             sidebar.draw_viewer()
 
-        sidebar.handle_mouse(40, 0, self.left_click())
+    def test_switching_to_a_changed_document_rereads_it_from_disk(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            proposal_path = Path(temporary) / "proposal.md"
+            tasks_path = Path(temporary) / "tasks.md"
+            proposal_path.write_text("old proposal", encoding="utf-8")
+            tasks_path.write_text("tasks", encoding="utf-8")
+            proposal = Artifact("proposal", "Proposal", proposal_path, content="stale from scan")
+            tasks = Artifact("tasks", "Tasks", tasks_path)
+            sidebar = self.make_sidebar([proposal, tasks])
 
-        self.assertIs(sidebar.viewer, artifact)
-        self.assertEqual(sidebar.viewer_offset, 3)
+            sidebar.open_artifact_by_key("proposal")
+            self._draw(sidebar)
+            self.assertEqual(proposal.content, "old proposal")  # opening reads from disk
+
+            sidebar.open_artifact_by_key("tasks")  # switch away
+            self._draw(sidebar)
+            proposal_path.write_text("NEWPROPOSAL", encoding="utf-8")  # changes while not shown
+
+            sidebar.open_artifact_by_key("proposal")  # switch back
+            self._draw(sidebar)
+            self.assertEqual(proposal.content, "NEWPROPOSAL")
+            self.assertTrue(
+                any("NEWPROPOSAL" in text for _y, _x, text, _s in sidebar.screen.writes)
+            )
+
+    def test_visible_document_refreshes_without_input_and_clamps_offset(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "proposal.md"
+            path.write_text("\n\n".join(f"para {index}" for index in range(100)), encoding="utf-8")
+            proposal = Artifact("proposal", "Proposal", path)
+            sidebar = self.make_sidebar([proposal])
+            sidebar.open_artifact_by_key("proposal")
+            self._draw(sidebar)
+
+            _wrapped, visible = sidebar.viewer_dimensions()  # constant; independent of length
+            sidebar.viewer_offset = 30
+
+            # Still-long file: the reader's position is preserved across the refresh.
+            path.write_text("\n\n".join(f"para {index}" for index in range(60)), encoding="utf-8")
+            self._draw(sidebar)
+            wrapped, _ = sidebar.viewer_dimensions()
+            self.assertEqual(sidebar.viewer_offset, clamp_document_offset(30, len(wrapped), visible))
+
+            # Short file: the position is clamped so it never rests beyond the last line.
+            path.write_text("FRESHTOKEN one line", encoding="utf-8")
+            self._draw(sidebar)
+            self.assertEqual(proposal.content, "FRESHTOKEN one line")  # updated on its own
+            wrapped, _ = sidebar.viewer_dimensions()
+            self.assertLessEqual(sidebar.viewer_offset, max(0, len(wrapped) - visible))
+            self.assertTrue(
+                any("FRESHTOKEN" in text for _y, _x, text, _s in sidebar.screen.writes)
+            )
+
+    def test_unchanged_file_is_not_rereread(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "proposal.md"
+            path.write_text("body", encoding="utf-8")
+            proposal = Artifact("proposal", "Proposal", path)
+            sidebar = self.make_sidebar([proposal])
+            sidebar.open_artifact_by_key("proposal")
+            self._draw(sidebar)  # first read
+
+            self.assertFalse(
+                document_reread_needed(sidebar._viewer_signature, viewer_file_signature(path))
+            )
+            with patch("sidebar.read_artifact") as reader:
+                self._draw(sidebar)  # file unchanged
+            reader.assert_not_called()
+
+    def test_deleted_open_document_shows_empty_without_raising(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "proposal.md"
+            path.write_text("body", encoding="utf-8")
+            proposal = Artifact("proposal", "Proposal", path)
+            sidebar = self.make_sidebar([proposal])
+            sidebar.open_artifact_by_key("proposal")
+            self._draw(sidebar)
+            self.assertEqual(proposal.content, "body")
+
+            path.unlink()
+            self._draw(sidebar)  # must not raise
+            self.assertEqual(proposal.content, "")
 
     def test_click_outside_targets_preserves_view_state(self):
         sidebar = self.make_sidebar()
