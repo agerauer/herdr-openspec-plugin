@@ -1893,6 +1893,18 @@ class Sidebar:
             self.change_index = index
             self.artifact_index = 0
             self.focus = "changes"
+        elif (
+            action == "open_change"
+            and not self.viewer
+            and index is not None
+            and 0 <= index < len(self.changes)
+        ):
+            # Clicking a card's name selects that change first, so the Proposal that
+            # opens is its own and not the previously selected change's.
+            self.change_index = index
+            self.artifact_index = 0
+            self.focus = "changes"
+            self.open_artifact_by_key("proposal")
         elif action == "agent_action" and not self.viewer:
             target = index if index is not None else self.change_index
             if 0 <= target < len(self.changes):
@@ -2121,7 +2133,15 @@ class Sidebar:
             name_style |= curses.color_pair(1)
         if selected:
             name_style |= curses.A_REVERSE
-        self.put(top, 1, format_card_name(change, max(0, width - 2), selected), name_style)
+        name_text = format_card_name(change, max(0, width - 2), selected)
+        self.put(top, 1, name_text, name_style)
+        # The name opens the change's Proposal. Registered here, before draw_main adds
+        # the card-wide select target, so first-match-wins gives the name precedence —
+        # the same ordering the action button relies on. The region covers only the
+        # drawn text, so a click beside a short name still just selects.
+        self.register_hit_target(
+            top, 1, top + 1, 1 + visible_width(name_text), "open_change", index
+        )
 
         action = agent_action_for_state(state) if self.in_herdr else None
         button = f"[{action}]" if action else ""

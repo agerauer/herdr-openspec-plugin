@@ -497,6 +497,82 @@ class SidebarModelTests(unittest.TestCase):
 
         self.assertEqual(sidebar.change_index, 0)
 
+    def _card_list(self, temporary, second_has_proposal=True):
+        """Two drawn change cards, each backed by a real Proposal file on disk."""
+        first = Path(temporary) / "alpha.md"
+        first.write_text("# Alpha proposal", encoding="utf-8")
+        second = Path(temporary) / "beta.md"
+        if second_has_proposal:
+            second.write_text("# Beta proposal", encoding="utf-8")
+        sidebar = self.make_sidebar()
+        sidebar.changes = [
+            Change("alpha", Path(temporary), artifacts=[Artifact("proposal", "Proposal", first)]),
+            Change("beta", Path(temporary), artifacts=[Artifact("proposal", "Proposal", second)]),
+        ]
+        sidebar.change_index = 0
+        with patch("sidebar.curses.color_pair", return_value=0):
+            sidebar.draw_main()
+        return sidebar
+
+    def _name_target(self, sidebar, index):
+        return next(
+            t for t in sidebar.hit_targets if t.action == "open_change" and t.index == index
+        )
+
+    def test_clicking_a_change_name_opens_its_proposal(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            sidebar = self._card_list(temporary)
+            target = self._name_target(sidebar, 0)
+
+            with patch("sidebar.curses.color_pair", return_value=0):
+                sidebar.handle_mouse(target.left, target.top, self.left_click())
+
+            self.assertIsNotNone(sidebar.viewer)
+            self.assertEqual(sidebar.viewer.key, "proposal")
+            self.assertEqual(sidebar.change.name, "alpha")
+
+    def test_clicking_an_unselected_change_name_opens_that_changes_proposal(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            sidebar = self._card_list(temporary)
+            target = self._name_target(sidebar, 1)  # "beta", not the selected change
+
+            with patch("sidebar.curses.color_pair", return_value=0):
+                sidebar.handle_mouse(target.left, target.top, self.left_click())
+
+            self.assertEqual(sidebar.change_index, 1)
+            self.assertEqual(sidebar.change.name, "beta")
+            self.assertIsNotNone(sidebar.viewer)
+            # The document is beta's own Proposal, not the previously selected alpha's.
+            self.assertIs(sidebar.viewer, sidebar.changes[1].artifacts[0])
+
+    def test_clicking_a_name_without_a_proposal_reports_and_stays_on_the_list(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            sidebar = self._card_list(temporary, second_has_proposal=False)
+            target = self._name_target(sidebar, 1)
+
+            with patch("sidebar.curses.color_pair", return_value=0):
+                sidebar.handle_mouse(target.left, target.top, self.left_click())
+
+            self.assertEqual(sidebar.change_index, 1)  # still selects it
+            self.assertIsNone(sidebar.viewer)  # but opens nothing
+            self.assertIn("does not exist", sidebar.message)
+
+    def test_clicking_a_card_away_from_its_name_only_selects(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            sidebar = self._card_list(temporary)
+            target = self._name_target(sidebar, 1)
+
+            with patch("sidebar.curses.color_pair", return_value=0):
+                # Just past the end of the drawn name, on the name's own row.
+                sidebar.handle_mouse(target.right, target.top, self.left_click())
+            self.assertEqual(sidebar.change_index, 1)
+            self.assertIsNone(sidebar.viewer)
+
+            with patch("sidebar.curses.color_pair", return_value=0):
+                sidebar.handle_mouse(4, target.top + 1, self.left_click())  # status line
+                sidebar.handle_mouse(4, target.top + 2, self.left_click())  # description
+            self.assertIsNone(sidebar.viewer)
+
     def test_viewer_header_back_label_is_clickable_and_clipped(self):
         artifact = Artifact(
             "proposal",

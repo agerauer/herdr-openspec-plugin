@@ -95,6 +95,7 @@ The plugin resolves the pane immediately to its left, confirms it's a coding age
 | `r` | Refresh now (the pane also watches for changes) |
 | `m` | Toggle the pane's mouse capture — off to select/copy text with the terminal, on for in-pane clicks and wheel scrolling |
 | `q` | Close the review pane |
+| Left-click a change's name | Select that change and open its Proposal |
 | Left-click a change card | Select that change |
 | Left-click a card's action button | Select the change and send its next action to the agent on the left |
 | Left-click a viewer tab | Switch to that artifact |
