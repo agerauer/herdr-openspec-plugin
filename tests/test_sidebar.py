@@ -30,6 +30,10 @@ from sidebar import (
     find_project,
     format_card_name,
     format_card_status,
+    github_login_or_name,
+    parse_change_authors,
+    collect_change_authors,
+    LOCAL_AUTHOR,
     viewer_file_signature,
     document_reread_needed,
     running_in_herdr,
@@ -518,6 +522,137 @@ class SidebarModelTests(unittest.TestCase):
         return next(
             t for t in sidebar.hit_targets if t.action == "open_change" and t.index == index
         )
+
+    def test_github_login_is_derived_from_a_noreply_email(self):
+        self.assertEqual(
+            github_login_or_name("20586+agerauer@users.noreply.github.com", "Andreas Gerauer"),
+            "agerauer",
+        )
+        self.assertEqual(
+            github_login_or_name("agerauer@users.noreply.github.com", "Andreas Gerauer"),
+            "agerauer",
+        )
+        # An ordinary address encodes no login, so the commit name stands in.
+        self.assertEqual(github_login_or_name("andi@example.com", "Andreas Gerauer"), "Andreas Gerauer")
+        self.assertEqual(github_login_or_name("", "Andreas Gerauer"), "Andreas Gerauer")
+
+    def test_change_authors_resolve_to_the_earliest_adding_commit(self):
+        # git log lists newest first; the oldest entry for a folder must win.
+        output = "\n".join(
+            [
+                "C|new@users.noreply.github.com|New Person",
+                "",
+                "openspec/changes/alpha/tasks.md",
+                "C|1+creator@users.noreply.github.com|Creator",
+                "",
+                "openspec/changes/alpha/proposal.md",
+                "openspec/changes/beta/proposal.md",
+                "openspec/changes/archive/2026-01-01-old/proposal.md",
+            ]
+        )
+
+        authors = parse_change_authors(output)
+
+        self.assertEqual(authors["alpha"], "creator")  # earliest commit, not "New Person"
+        self.assertEqual(authors["beta"], "creator")
+        self.assertNotIn("archive", authors)  # archived changes are not listed
+        self.assertNotIn("2026-01-01-old", authors)
+
+    def test_parse_change_authors_tolerates_empty_and_malformed_input(self):
+        self.assertEqual(parse_change_authors(""), {})
+        self.assertEqual(parse_change_authors("not a commit line\n"), {})
+        # A path with no owning commit yet is ignored rather than misattributed.
+        self.assertEqual(parse_change_authors("openspec/changes/alpha/proposal.md"), {})
+
+    def test_author_lookup_is_one_call_per_root_and_none_without_a_worktree(self):
+        calls = []
+
+        def runner(project, args):
+            calls.append(args)
+            if args[0] == "rev-parse":
+                return "true"
+            return "C|1+creator@users.noreply.github.com|Creator\n\nopenspec/changes/alpha/proposal.md"
+
+        authors = collect_change_authors(Path("/tmp/project"), runner)
+
+        self.assertEqual(authors, {"alpha": "creator"})
+        self.assertEqual(len(calls), 2)  # worktree check + one history walk, not one per change
+        self.assertEqual(calls[1][0], "log")
+
+        # Not a worktree, and a failing query, are both "cannot tell" — not "local".
+        self.assertIsNone(collect_change_authors(Path("/tmp/project"), lambda p, a: None))
+        self.assertIsNone(
+            collect_change_authors(
+                Path("/tmp/project"), lambda p, a: "true" if a[0] == "rev-parse" else None
+            )
+        )
+
+    def _authored_sidebar(self, author, width_name="alpha"):
+        change = Change(width_name, Path("/tmp/alpha"), goal="First change", author=author)
+        sidebar = self.make_sidebar()
+        sidebar.changes = [change]
+        sidebar.change_index = 0
+        with patch("sidebar.curses.color_pair", return_value=0):
+            sidebar.draw_main()
+        return sidebar
+
+    def test_card_shows_the_author_beside_the_name(self):
+        sidebar = self._authored_sidebar("agerauer")
+
+        name_write = next(w for w in sidebar.screen.writes if "alpha" in w[2])
+        author_write = next(w for w in sidebar.screen.writes if "agerauer" in w[2])
+
+        self.assertEqual(author_write[0], name_write[0])  # same row, beside the name
+        self.assertEqual(author_write[1], name_write[1] + len(name_write[2]))  # directly after
+        self.assertIn("·", author_write[2])
+        self.assertEqual(author_write[3], curses.A_DIM)  # quieter than the bold name
+        self.assertNotEqual(author_write[3], name_write[3])
+
+    def test_card_shows_local_for_an_uncommitted_change_and_nothing_without_git(self):
+        local = self._authored_sidebar(LOCAL_AUTHOR)
+        self.assertTrue(any(LOCAL_AUTHOR in w[2] for w in local.screen.writes))
+
+        unknown = self._authored_sidebar(None)
+        row = next(w for w in unknown.screen.writes if "alpha" in w[2])[0]
+        same_row = [w[2] for w in unknown.screen.writes if w[0] == row]
+        self.assertFalse(any("·" in text for text in same_row))  # no author, no separator
+
+    def test_narrow_pane_drops_the_author_rather_than_the_name(self):
+        long_name = "a-very-long-change-name-that-fills-the-entire-card-width"
+        sidebar = self._authored_sidebar("agerauer", width_name=long_name)
+
+        writes = [w[2] for w in sidebar.screen.writes]
+        self.assertTrue(any(long_name[:20] in text for text in writes))  # name still drawn
+        self.assertFalse(any("agerauer" in text for text in writes))  # author dropped whole
+
+    def test_clicking_the_author_selects_without_opening(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "alpha.md"
+            path.write_text("# Alpha proposal", encoding="utf-8")
+            sidebar = self.make_sidebar()
+            sidebar.changes = [
+                Change(
+                    "alpha",
+                    Path(temporary),
+                    artifacts=[Artifact("proposal", "Proposal", path)],
+                    author="agerauer",
+                )
+            ]
+            sidebar.change_index = 0
+            with patch("sidebar.curses.color_pair", return_value=0):
+                sidebar.draw_main()
+
+            author_write = next(w for w in sidebar.screen.writes if "agerauer" in w[2])
+            with patch("sidebar.curses.color_pair", return_value=0):
+                sidebar.handle_mouse(author_write[1] + 2, author_write[0], self.left_click())
+
+            self.assertEqual(sidebar.change_index, 0)
+            self.assertIsNone(sidebar.viewer)  # the author is not part of the name target
+
+            target = self._name_target(sidebar, 0)  # the name itself still opens
+            with patch("sidebar.curses.color_pair", return_value=0):
+                sidebar.handle_mouse(target.left, target.top, self.left_click())
+            self.assertIsNotNone(sidebar.viewer)
 
     def test_clicking_a_change_name_opens_its_proposal(self):
         with tempfile.TemporaryDirectory() as temporary:

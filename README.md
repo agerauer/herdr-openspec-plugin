@@ -53,6 +53,7 @@ Then reload: `herdr server reload-config`.
 ## What you get
 
 - **Every active change as a card** — bold name, a `STATE · done/total · N Artifacts` line, and the description — for all changes at once, not just a selected one. Cards fill the pane height and the selection always stays in view.
+- **Who created each change**, shown next to its name as `‹name› · ‹author›`. The author comes from the commit that first added the change — a GitHub login when the commit email is a GitHub noreply address, otherwise the commit author's name. A change you haven't committed yet reads `local`, and outside a Git worktree no author is shown. It's resolved from local history alone: no network call, no `gh`, no token.
 - **A state derived from progress and validity**, color-coded and prominent: `DRAFT` (no tasks yet, or a required artifact missing), `READY` (`0/Y`), `IN PROGRESS` (`X/Y`), `DONE` (`Y/Y`), or `INVALID` (validation failed).
 - **Markdown-rendered artifacts** — color-coded headings, **bold**, *italic*, inline and fenced code, links, nested and ordered lists with hanging indents, and pipe tables that shrink to fit the pane.
 - **A tabbed document viewer** — the standard artifacts (Proposal, Design, Tasks), any other `.md` documents in the change folder, and one tab per spec, each color-coded by group. The tab bar wraps as needed and the change name heads the view.

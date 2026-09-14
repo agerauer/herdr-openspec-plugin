@@ -38,6 +38,10 @@ REQUIREMENT = re.compile(r"^###\s+Requirement:\s*(.+?)\s*$", re.I)
 GIT_TIMEOUT_SECONDS = 1.5
 OPENSPEC_SEARCH_DEPTH = 2
 DISPLAY_SEPARATOR = " · "
+GITHUB_NOREPLY_DOMAIN = "@users.noreply.github.com"
+# Shown for a change whose folder has no creating commit yet, so "not committed"
+# stays distinguishable from "authored by the current user".
+LOCAL_AUTHOR = "local"
 SKIPPED_DIRECTORY_NAMES = frozenset(
     {
         "node_modules",
@@ -100,6 +104,7 @@ class Change:
     tasks_total: int = 0
     worktree_touched: bool = False
     worktree_activity: int = 0
+    author: str | None = None
     validation: str | None = None
     validation_detail: str = ""
     folder_name: str = ""
@@ -243,6 +248,84 @@ def run_git(project: Path, args: list[str]) -> str | None:
     except (OSError, subprocess.TimeoutExpired):
         return None
     return result.stdout.strip() if result.returncode == 0 else None
+
+
+def github_login_or_name(email: str, name: str) -> str:
+    """The GitHub login encoded in a noreply address, else the commit author's name.
+
+    GitHub authors commits as ``<id>+<login>@users.noreply.github.com`` (and, for
+    older accounts, ``<login>@users.noreply.github.com``), so the login is
+    recoverable locally — no API call for what is a decorative field.
+    """
+    address = (email or "").strip()
+    if address.lower().endswith(GITHUB_NOREPLY_DOMAIN):
+        local_part = address[: -len(GITHUB_NOREPLY_DOMAIN)]
+        login = local_part.rpartition("+")[2]  # "20586+agerauer" -> "agerauer"
+        if login:
+            return login
+    return (name or "").strip()
+
+
+def change_folder_from_path(path: str) -> str:
+    """The active change folder a repo-relative path belongs to, if any.
+
+    Paths come from Git relative to the repository root, which may sit above a
+    nested OpenSpec project, so the marker is located anywhere in the path.
+    Archived changes are not shown in the list and are ignored.
+    """
+    marker = "openspec/changes/"
+    index = path.find(marker)
+    if index == -1:
+        return ""
+    folder, _, rest = path[index + len(marker) :].partition("/")
+    if not rest or folder == "archive":
+        return ""  # the folder itself, or something inside archive/
+    return folder
+
+
+def parse_change_authors(output: str) -> dict[str, str]:
+    """Map each change folder to the author of the earliest commit that added it.
+
+    Reads ``git log --diff-filter=A --format=C|%ae|%an --name-only`` output. Git
+    lists commits newest first, so entries parsed later are older and overwrite
+    newer ones — leaving each folder mapped to the commit that created it.
+    """
+    authors: dict[str, str] = {}
+    author = ""
+    for raw in (output or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("C|"):
+            email, _, name = line[2:].partition("|")
+            author = github_login_or_name(email, name)
+            continue
+        folder = change_folder_from_path(line)
+        if folder and author:
+            authors[folder] = author
+    return authors
+
+
+def collect_change_authors(
+    openspec_project: Path, runner: "GitRunner" = run_git
+) -> dict[str, str] | None:
+    """Every change folder's creating author in one root, in a single history walk.
+
+    Returns None when authorship cannot be determined at all — the root is not a
+    Git worktree, or the query failed or timed out — so the caller shows no
+    author. A mapping (possibly empty) means the root *is* a worktree, and any
+    change missing from it simply has no creating commit yet. Keeping those two
+    cases apart is what stops a failed query from looking like unshared work.
+    """
+    if runner(openspec_project, ["rev-parse", "--is-inside-work-tree"]) != "true":
+        return None
+    output = runner(
+        openspec_project,
+        ["log", "--diff-filter=A", "--format=C|%ae|%an", "--name-only", "--", "openspec/changes"],
+    )
+    if output is None:
+        return None
+    return parse_change_authors(output)
 
 
 def resolve_git_base(project: Path, runner: GitRunner = run_git) -> GitBase | None:
@@ -1149,11 +1232,19 @@ def discover_changes(
     project: Path,
     snapshot: WorktreeSnapshot | None = None,
     openspec_projects: list[Path] | None = None,
+    runner: GitRunner = run_git,
 ) -> list[Change]:
     projects = openspec_projects if openspec_projects is not None else discover_openspec_projects(project)
     changes: list[Change] = []
     for openspec_project in projects:
-        changes.extend(discover_project_changes(project, openspec_project))
+        project_changes = discover_project_changes(project, openspec_project)
+        # One history walk per root, not one per change, and resolved in the root
+        # the change was discovered in rather than the workspace root.
+        authors = collect_change_authors(openspec_project, runner)
+        if authors is not None:
+            for change in project_changes:
+                change.author = authors.get(change.folder_name, LOCAL_AUTHOR)
+        changes.extend(project_changes)
     if snapshot:
         active_names = {change.name for change in changes}
         touched_names = set(paths_by_change(snapshot.changed_paths, active_names))
@@ -2139,9 +2230,15 @@ class Sidebar:
         # the card-wide select target, so first-match-wins gives the name precedence —
         # the same ordering the action button relies on. The region covers only the
         # drawn text, so a click beside a short name still just selects.
-        self.register_hit_target(
-            top, 1, top + 1, 1 + visible_width(name_text), "open_change", index
-        )
+        name_end = 1 + visible_width(name_text)
+        self.register_hit_target(top, 1, top + 1, name_end, "open_change", index)
+        if change.author:
+            # The name owns the width: when both do not fit, the author is dropped
+            # whole rather than the name shortened. Drawn dim and outside the name's
+            # hit target, so clicking an author selects without opening.
+            suffix = f"{DISPLAY_SEPARATOR}{change.author}"
+            if name_end + visible_width(suffix) <= width - 1:
+                self.put(top, name_end, suffix, curses.A_DIM)
 
         action = agent_action_for_state(state) if self.in_herdr else None
         button = f"[{action}]" if action else ""
