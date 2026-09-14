@@ -600,15 +600,65 @@ class SidebarModelTests(unittest.TestCase):
             wrapped, _ = sidebar.viewer_dimensions()
             self.assertEqual(sidebar.viewer_offset, clamp_document_offset(30, len(wrapped), visible))
 
-            # Short file: the position is clamped so it never rests beyond the last line.
+            # Short file: the drawn window is clamped, so the document is still on
+            # screen rather than sliced past its end.
+            sidebar.screen.writes.clear()
             path.write_text("FRESHTOKEN one line", encoding="utf-8")
             self._draw(sidebar)
             self.assertEqual(proposal.content, "FRESHTOKEN one line")  # updated on its own
-            wrapped, _ = sidebar.viewer_dimensions()
-            self.assertLessEqual(sidebar.viewer_offset, max(0, len(wrapped) - visible))
             self.assertTrue(
                 any("FRESHTOKEN" in text for _y, _x, text, _s in sidebar.screen.writes)
             )
+
+    def test_a_document_caught_mid_rewrite_keeps_the_readers_place(self):
+        """A writer truncates before writing, so a frame can read the file short.
+
+        Clamping that frame must not cost the reader their position, or every
+        scroll down is yanked back to the top while an agent edits the file.
+        """
+        full = "\n\n".join(f"para {index}" for index in range(80))
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "proposal.md"
+            path.write_text(full, encoding="utf-8")
+            proposal = Artifact("proposal", "Proposal", path)
+            sidebar = self.make_sidebar([proposal])
+            sidebar.open_artifact_by_key("proposal")
+            self._draw(sidebar)
+
+            for _ in range(50):
+                sidebar.handle(curses.KEY_DOWN)
+            self._draw(sidebar)
+            settled = sidebar.viewer_offset
+            self.assertEqual(settled, 50)
+
+            path.write_text("", encoding="utf-8")  # caught mid-write
+            self._draw(sidebar)
+            path.write_text(full, encoding="utf-8")  # writer finishes
+            self._draw(sidebar)
+            self.assertEqual(sidebar.viewer_offset, settled)  # place kept
+
+            sidebar.handle(curses.KEY_DOWN)  # and scrolling still advances
+            self._draw(sidebar)
+            self.assertEqual(sidebar.viewer_offset, settled + 1)
+
+    def test_scrolling_a_genuinely_shorter_document_settles_in_range(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "proposal.md"
+            path.write_text("\n\n".join(f"para {index}" for index in range(80)), encoding="utf-8")
+            proposal = Artifact("proposal", "Proposal", path)
+            sidebar = self.make_sidebar([proposal])
+            sidebar.open_artifact_by_key("proposal")
+            self._draw(sidebar)
+            for _ in range(50):
+                sidebar.handle(curses.KEY_DOWN)
+            self._draw(sidebar)
+
+            path.write_text("one\n\ntwo\n\nthree", encoding="utf-8")  # permanently shorter
+            self._draw(sidebar)
+
+            sidebar.handle(curses.KEY_UP)  # first scroll snaps into the new range
+            wrapped, visible = sidebar.viewer_dimensions()
+            self.assertLessEqual(sidebar.viewer_offset, max(0, len(wrapped) - visible))
 
     def test_unchanged_file_is_not_rereread(self):
         with tempfile.TemporaryDirectory() as temporary:

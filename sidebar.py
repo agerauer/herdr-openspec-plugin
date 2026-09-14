@@ -2077,13 +2077,18 @@ class Sidebar:
         wrapped = self.render_viewer(artifact.content, width)
         visible = geo["visible"]
         max_offset = max(0, len(wrapped) - visible)
-        self.viewer_offset = clamp_document_offset(self.viewer_offset, len(wrapped), visible)
+        # Clamp for this frame only, never back into self.viewer_offset. A document
+        # caught mid-rewrite reads short (a writer truncates before writing), and
+        # storing the clamped value would drop the reader at the top for good; keeping
+        # their position means it returns with the content. A genuinely shorter
+        # document self-corrects on the next scroll, which clamps as it moves.
+        offset = clamp_document_offset(self.viewer_offset, len(wrapped), visible)
         for row, line in enumerate(
-            wrapped[self.viewer_offset : self.viewer_offset + visible], start=geo["content_top"]
+            wrapped[offset : offset + visible], start=geo["content_top"]
         ):
             self.draw_styled_line(row, 2, line, width)
         if max_offset:
-            percent = round(100 * self.viewer_offset / max_offset)
+            percent = round(100 * offset / max_offset)
             self.put(geo["percent_row"], max(1, width - 6), f"{percent:>3}%", curses.A_DIM)
         self.draw_footer(geo["footer_top"], self.viewer_footer_actions())
 
