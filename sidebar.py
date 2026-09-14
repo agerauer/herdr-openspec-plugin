@@ -55,9 +55,13 @@ VIEWER_CORE_TABS = (
     ("tasks", "Tasks"),
 )
 STANDARD_ARTIFACT_FILES = frozenset({"proposal.md", "design.md", "tasks.md"})
-# Mouse events the pane captures. Motion reporting is intentionally excluded: it
-# is unused and is the most disruptive to the terminal's own text selection.
-MOUSE_MASK = curses.ALL_MOUSE_EVENTS
+# Mouse events the pane captures. Motion reporting must be requested even though
+# the pane tracks no movement: this platform's ncurses is built with mouse version
+# 1, which has no representation for button 5, so a wheel-down arrives carrying the
+# motion bit. Without it in the mask, getmouse() cannot decode the event at all and
+# raises, and wheel-down is silently lost. Releasing the mouse for the terminal's
+# own selection is what the `m` toggle is for.
+MOUSE_MASK = curses.ALL_MOUSE_EVENTS | getattr(curses, "REPORT_MOUSE_POSITION", 0)
 # Tab color groups (curses pair numbers, initialized in curses_main): the three
 # standard artifacts, the non-standard change documents, and the specifications.
 TAB_PAIR_STANDARD = 1  # cyan
@@ -677,6 +681,9 @@ def mouse_wheel_direction(button_state: int) -> int:
         "BUTTON5_PRESSED",
         "BUTTON5_CLICKED",
         "BUTTON4_RELEASED",
+        # Load-bearing on ncurses builds without button 5: a wheel-down is
+        # reported with the motion bit rather than a button-5 bit.
+        "REPORT_MOUSE_POSITION",
     ) | NCURSES_BUTTON5_RELEASED | NCURSES_BUTTON5_PRESSED | NCURSES_BUTTON5_CLICKED
     if button_state & wheel_up:
         return -1

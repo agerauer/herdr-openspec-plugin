@@ -1308,10 +1308,12 @@ class SidebarModelTests(unittest.TestCase):
         self.assertEqual(mouse_wheel_direction(1 << 24), 1)
         self.assertEqual(mouse_wheel_direction(1 << 25), 1)
         self.assertEqual(mouse_wheel_direction(1 << 26), 1)
-        # Motion reporting is no longer part of the wheel mask (and no longer requested).
+        # Where ncurses has no button 5, wheel-down arrives carrying the motion bit,
+        # so it counts as wheel-down and must be in the requested mask to decode at all.
         motion = getattr(curses, "REPORT_MOUSE_POSITION", 0)
         if motion:
-            self.assertEqual(mouse_wheel_direction(motion), 0)
+            self.assertEqual(mouse_wheel_direction(motion), 1)
+            self.assertTrue(MOUSE_MASK & motion)
 
     def test_unrecognized_mouse_state_does_not_scroll_document(self):
         sidebar = self.make_sidebar()
