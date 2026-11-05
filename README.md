@@ -50,6 +50,32 @@ description = "Open OpenSpec review"
 
 Then reload: `herdr server reload-config`.
 
+## Herdr desktop app
+
+The same review pane also ships as a native mod for the [Herdr desktop app](https://herdr.dev/) (`herdr-app`), in [`mods/openspec-review/`](mods/openspec-review/). It needs no Python: it's JavaScript that Herdr runs, and it renders Markdown with Herdr's own text view.
+
+```sh
+cp -R mods/openspec-review ~/.config/herdr-app/mods/
+herdr-app check ~/.config/herdr-app/mods/openspec-review
+```
+
+Open it beside the focused pane with `herdr-app do mod.open --name openspec-review`, or bind a key in `~/.config/herdr-app/keys.json`:
+
+```json
+{ "global": { "cmd-shift-o": "mod.open:openspec-review" } }
+```
+
+Opening it again in the same tab focuses the existing pane. Every action is also a command (`openspec-review.validate`, `openspec-review.send`, `openspec-review.refresh`, …), so you can bind them globally.
+
+Differences from the terminal plugin:
+
+- **Agent hand-off** goes to the Claude Code agent in the pane's tab (the one it was opened beside, if it's still there), not to whichever pane is geometrically on the left.
+- **Mouse capture (`m`) is gone:** text in documents is selectable directly.
+- **Your changes come first**, under a *Yours* heading above *Others*. A change is yours when the commit that created it has your `git config user.email`, `user.name` or GitHub login, or when it isn't committed yet. The usual worktree ordering applies inside each section.
+- **One tab per OpenSpec project** instead of one mixed list: when the workspace has nested `openspec/` trees, a tab bar shows each project with its change count (in the accent colour if your branch touches it). Click a tab, or press `[`/`]` or `Tab`/`Shift-Tab`, to switch; each tab remembers its selection. The pane opens on the project holding your branch's change.
+- Documents scroll smoothly with the wheel or trackpad; `↑`/`↓` and `Page Up`/`Page Down` still scroll by line and page.
+- Spaces on another machine should work (Git, `find` and `openspec` run there), but this is untested.
+
 ## What you get
 
 - **Every active change as a card** — bold name, a `STATE · done/total · N Artifacts` line, and the description — for all changes at once, not just a selected one. Cards fill the pane height and the selection always stays in view.
@@ -120,6 +146,7 @@ Run the tests:
 
 ```sh
 python3 -m unittest discover -s tests -v
+node --test tests/mod/*.test.mjs   # the desktop mod's logic (mods/openspec-review/model.js)
 ```
 
 ## License
