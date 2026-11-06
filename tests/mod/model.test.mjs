@@ -100,3 +100,16 @@ test("own changes are recognised by email, name or GitHub login, and grouped fir
   const c = (name, mine) => ({ name, mine });
   assert.deepEqual(M.ownFirst([c("x", false), c("y", true), c("z", false), c("w", true)]).map((x) => x.name), ["y", "w", "x", "z"]);
 });
+
+test("markdown splits into styled blocks with nested lists, tasks and OpenSpec labels", () => {
+  const md = "# T\n\nPara **b**\nmore\n\n- a\n  wrapped\n  - nested\n1. one\n- [x] done\n- [ ] open\n\n> q\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```js\nx  = 1\n```\n---\n";
+  const blocks = M.markdownBlocks(md);
+  assert.deepEqual(blocks.map((b) => b.type), ["heading", "para", "list", "quote", "table", "code", "rule"]);
+  assert.equal(blocks[1].text, "Para **b**\nmore");
+  assert.deepEqual(blocks[2].items.map((i) => [i.depth, i.ordered, i.checked, i.text]),
+    [[0, false, null, "a\nwrapped"], [1, false, null, "nested"], [0, true, null, "one"], [0, false, true, "done"], [0, false, false, "open"]]);
+  assert.deepEqual(blocks[5], { type: "code", lang: "js", text: "x  = 1" });
+  assert.deepEqual(M.headingParts("Requirement: Login is `fast`"), { label: "Requirement", text: "Login is fast" });
+  assert.deepEqual(M.headingParts("MODIFIED Requirements"), { delta: "MODIFIED", text: "MODIFIED Requirements" });
+  assert.deepEqual(M.headingParts("Why"), { text: "Why" });
+});

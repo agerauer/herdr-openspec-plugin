@@ -281,3 +281,89 @@ export function documentOrder(artifacts) {
 
 /** Clamps value to [lo, hi]. */
 export const clamp = (value, lo, hi) => Math.max(lo, Math.min(hi, value));
+
+// ---- Markdown blocks ----------------------------------------------------------------
+
+const FENCE = /^\s*(`{3,}|~{3,})\s*([\w+-]*)/;
+const HEADING = /^(#{1,6})\s+(.*?)\s*#*\s*$/;
+const RULE = /^\s{0,3}([-*_])(\s*\1){2,}\s*$/;
+const ITEM = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
+const TABLE_RULE = /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/;
+const CHECK = /^\[([ xX])\]\s+/;
+
+/** Splits Markdown into the blocks the viewer styles itself. Inline Markdown stays in each
+ *  block's text. Blocks: heading {level, text}, para {text}, list {items: [{depth, marker,
+ *  ordered, checked, text}]}, code {lang, text}, quote {text}, table {text}, rule. */
+export function markdownBlocks(markdown) {
+  const src = (markdown || "").replace(/\r\n?/g, "\n").split("\n");
+  const blocks = [];
+  let i = 0;
+  const blank = (l) => !l || !l.trim();
+  const starts = (l, next) => HEADING.test(l) || FENCE.test(l) || RULE.test(l) || ITEM.test(l) || /^\s*>/.test(l)
+    || (l.includes("|") && next !== undefined && TABLE_RULE.test(next));
+  while (i < src.length) {
+    const line = src[i];
+    if (blank(line)) { i++; continue; }
+    let m;
+    if ((m = FENCE.exec(line))) {
+      const close = m[1][0], body = [];
+      for (i++; i < src.length && !new RegExp(`^\\s*\\${close}{${m[1].length},}\\s*$`).test(src[i]); i++) body.push(src[i]);
+      i++;
+      blocks.push({ type: "code", lang: m[2] || "", text: body.join("\n") });
+    } else if ((m = HEADING.exec(line))) {
+      blocks.push({ type: "heading", level: m[1].length, text: m[2] }); i++;
+    } else if (RULE.test(line)) {
+      blocks.push({ type: "rule" }); i++;
+    } else if (line.includes("|") && src[i + 1] !== undefined && TABLE_RULE.test(src[i + 1])) {
+      const rows = [];
+      while (i < src.length && !blank(src[i]) && src[i].includes("|")) rows.push(src[i++]);
+      blocks.push({ type: "table", text: rows.join("\n") });
+    } else if (/^\s*>/.test(line)) {
+      const body = [];
+      while (i < src.length && /^\s*>/.test(src[i])) body.push(src[i++].replace(/^\s*>\s?/, ""));
+      blocks.push({ type: "quote", text: body.join("\n") });
+    } else if (ITEM.test(line)) {
+      const items = [], indents = [];
+      while (i < src.length) {
+        const l = src[i];
+        if (blank(l)) {
+          let j = i + 1; while (j < src.length && blank(src[j])) j++;
+          if (j < src.length && (ITEM.test(src[j]) || /^\s{2,}\S/.test(src[j]))) { i = j; continue; }
+          break;
+        }
+        const it = ITEM.exec(l);
+        if (it) {
+          const indent = it[1].replace(/\t/g, "    ").length;
+          while (indents.length && indents.at(-1) > indent) indents.pop();
+          if (!indents.length || indents.at(-1) < indent) indents.push(indent);
+          const check = CHECK.exec(it[3]);
+          items.push({
+            depth: indents.length - 1, marker: it[2], ordered: /\d/.test(it[2]),
+            checked: check ? check[1] !== " " : null, text: check ? it[3].slice(check[0].length) : it[3],
+          });
+          i++;
+        } else if (/^\s+\S/.test(l) || !starts(l, src[i + 1])) {
+          if (!items.length || (!/^\s/.test(l) && starts(l, src[i + 1]))) break;
+          items.at(-1).text += "\n" + l.trim(); i++;
+        } else break;
+      }
+      blocks.push({ type: "list", items });
+    } else {
+      const body = [];
+      while (i < src.length && !blank(src[i]) && !(body.length && starts(src[i], src[i + 1]))) body.push(src[i++]);
+      blocks.push({ type: "para", text: body.join("\n") });
+    }
+  }
+  return blocks;
+}
+
+/** Heading text with inline markers removed, and an OpenSpec label split off:
+ *  "Requirement: X" → {label: "Requirement", text: "X"}; "ADDED Requirements" → {delta: "ADDED"}. */
+export function headingParts(text) {
+  const plain = text.replace(/\[([^\]]*)\]\([^)]*\)/g, "$1").replace(/[*_`]/g, "").trim();
+  const delta = /^(ADDED|MODIFIED|REMOVED|RENAMED)\s+Requirements?$/i.exec(plain);
+  if (delta) return { delta: delta[1].toUpperCase(), text: plain };
+  const labelled = /^(Requirement|Scenario|Purpose|Why|What Changes|Impact|Context|Goals|Non-Goals|Decisions|Risks)\s*:\s*(.+)$/i.exec(plain);
+  if (labelled) return { label: labelled[1], text: labelled[2] };
+  return { text: plain };
+}

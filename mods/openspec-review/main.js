@@ -6,7 +6,7 @@ import { View, div } from "gpui-kit";
 import { v_flex, h_flex, TextView } from "gpui-base";
 import {
   exec, hc, readTextFile, watchFolder, spaces, panes, focused, agents, theme, run, props,
-  closeOverlay, nextCommand,
+  closeOverlay, nextCommand, settings,
 } from "herdr";
 import * as M from "./model.js";
 
@@ -145,6 +145,8 @@ async function loadWorkspace(start, on) {
 
 const STATE_COLOR = { INVALID: "ansi1", DRAFT: "dim", READY: "ansi6", "IN PROGRESS": "ansi3", DONE: "ansi2" };
 const GROUP_COLOR = { standard: "ansi6", doc: "ansi3", spec: "ansi2" };
+/** A theme colour with alpha (0–1), for tinted backgrounds. */
+const tint = (color, alpha) => /^#[0-9a-f]{6}$/i.test(color || "") ? color + Math.round(alpha * 255).toString(16).padStart(2, "0") : color;
 const isClaude = (a) => a.program?.key === "claude" || a.app === "claude-code" || a.app === "claude";
 
 export default class OpenSpecReview extends View {
@@ -156,11 +158,16 @@ export default class OpenSpecReview extends View {
     this.handle = cx.focus_handle();
     this.listOffset = 0; this.listHeight = 0; this.reveal = true;
     const p = props() || {};
+    // A layout block with `props.panel` (a side panel shared by every space) follows the
+    // focused tab's folder instead of keeping the one it started with.
+    this.panel = Boolean(p.panel);
     this.on = p.machine ?? null;
     this.start = p.folder || this.guessFolder();
+    this.followedTab = focused()?.tab ?? null;
     this.reload(cx);
     cx.timer.every(10000, (cx) => this.reload(cx));
-    if (this.on) cx.timer.every(3000, (cx) => this.refreshDoc(cx));
+    if (this.panel) cx.timer.every(700, (cx) => this.follow(cx));
+    cx.timer.every(3000, (cx) => { if (this.on) this.refreshDoc(cx); }); // no file watching on other machines
     cx.spawn(async (cx) => {
       for (;;) {
         const c = await nextCommand();
@@ -191,12 +198,48 @@ export default class OpenSpecReview extends View {
     closeOverlay(overlay);
   }
 
+  /** As a panel: follow the focused terminal's folder. Only a move to another repository
+   *  (or machine) starts over; a `cd` inside the same one just keeps the list. */
+  follow(cx) {
+    if (!this.panel || props()?.folder) return;
+    const f = focused();
+    if (!f) return;
+    // Focus on the panel itself (or another mod) says nothing new about where you work.
+    if (!f.cwd && f.tab === this.followedTab) return;
+    this.followedTab = f.tab;
+    const space = spaces().find((s) => s.id === f.space);
+    const on = space?.machine ?? null;
+    const folder = f.cwd || this.tabFolder(f.tab) || space?.folder || "";
+    if (!folder || (folder === this.followed && on === this.on)) return;
+    this.followed = folder;
+    const token = (this.followToken = (this.followToken || 0) + 1);
+    cx.spawn(async (cx) => {
+      const root = await resolveSearchRoot(folder, on);
+      if (token !== this.followToken) return; // focus moved on meanwhile
+      if (root === this.root && on === this.on) { this.start = folder; return; }
+      this.on = on; this.start = folder;
+      this.root = null; this.projects = null; this.all = []; this.changes = [];
+      this.project = null; this.places = {}; this.index = 0; this.doc = null;
+      this.listOffset = 0; this.first = true; this.error = null;
+      cx.notify();
+      this.reload(cx);
+    });
+  }
+
+  /** The focused terminal's folder in a tab, else its first terminal's. */
+  tabFolder(tab) {
+    const inTab = panes().filter((p) => p.tab === tab && p.cwd);
+    return (inTab.find((p) => p.focused) ?? inTab[0])?.cwd || "";
+  }
+
   guessFolder() {
-    const tab = this.myPane()?.tab ?? focused()?.tab;
-    const pane = panes().find((p) => p.tab === tab && p.cwd);
+    const f = focused();
+    const tab = (this.panel ? null : this.myPane()?.tab) ?? f?.tab;
     const space = spaces().find((s) => s.tabs.some((t) => t.id === tab)) ?? spaces().find((s) => s.active);
     this.on = this.on ?? space?.machine ?? null;
-    return pane?.cwd || space?.folder || "";
+    const folder = (this.panel && f?.cwd) || this.tabFolder(tab) || space?.folder || "";
+    this.followed = folder;
+    return folder;
   }
 
   myPane() {
@@ -221,9 +264,12 @@ export default class OpenSpecReview extends View {
     if (!this.start) return;
     if (this.loading) { this.pending = true; return; }
     this.loading = true;
+    const start = this.start, on = this.on;
     cx.spawn(async (cx) => {
       try {
-        const { root, projects, changes } = await loadWorkspace(this.start, this.on);
+        const { root, projects, changes } = await loadWorkspace(start, on);
+        // The panel moved to another folder while this ran: drop it and load the new one.
+        if (start !== this.start || on !== this.on) { this.pending = true; return; }
         const selected = this.change?.name;
         for (const c of changes) this.applyState(c);
         this.root = root; this.projects = projects; this.all = changes; this.error = null;
@@ -406,6 +452,8 @@ export default class OpenSpecReview extends View {
   }
 
   closePane() {
+    // A panel isn't a pane: hide its column (the layout's "panel"), never close a split pane.
+    if (this.panel) return run("layout.hide", { id: "panel" });
     const me = this.myPane();
     if (me) run("pane.close", { pane: me.pane });
   }
@@ -454,6 +502,10 @@ export default class OpenSpecReview extends View {
   // ---- Drawing ----
 
   render(cx) {
+    if (this.panel && !this.launcher && focused()?.tab !== this.followedTab) {
+      this.followedTab = focused()?.tab ?? null;
+      cx.timer.after(0, (cx) => { this.follow(cx); cx.notify(); });
+    }
     if (this.launcher) return div();
     const t = theme();
     const body = this.doc && this.change ? this.renderViewer(t) : this.renderList(t);
@@ -611,9 +663,59 @@ export default class OpenSpecReview extends View {
         .child(div().id("osr-doc-content").absolute().left(0).right(0).top(-this.offset).px(16).py(12)
           .on_size_change((size, cx) => { if (Math.abs(size.height - this.docHeight) > 1) { this.docHeight = size.height; cx.notify(); } })
           .child(doc.text
-            ? TextView.markdown(`osr-md-${change.name}-${doc.key}`, doc.text).selectable()
+            ? this.renderMarkdown(`osr-md-${change.name}-${doc.key}`, doc.text, t)
             : div().text_color(t.dim).child(doc.loaded ? "(empty)" : "Loading…")))
         .when(Boolean(thumb), (e) => e.child(div().absolute().right(2).w(4).rounded(2).bg(t.border).top(thumb.top).h(thumb.h))));
+  }
+
+  /** Markdown as styled blocks: coloured headings and OpenSpec labels, task checkboxes, list
+   *  markers, code, quotes. Inline Markdown in each block still goes through TextView. */
+  renderMarkdown(id, text, t) {
+    if (this.mdCache?.text !== text) this.mdCache = { text, blocks: M.markdownBlocks(text) };
+    const inline = (key, md) => TextView.markdown(`${id}-${key}`, md).selectable();
+    const mono = settings()?.font_family || "Menlo";
+    const HEAD = {
+      1: { size: 21, color: t.ansi6 }, 2: { size: 17, color: t.ansi3 }, 3: { size: 15, color: t.ansi2 },
+      4: { size: 14, color: t.ansi5 }, 5: { size: 13, color: t.ansi4 }, 6: { size: 13, color: t.muted },
+    };
+    const DELTA = { ADDED: t.ansi2, MODIFIED: t.ansi3, REMOVED: t.ansi1, RENAMED: t.ansi5 };
+    const LABEL = { requirement: t.ansi6, scenario: t.ansi5 };
+    const badge = (label, color) => div().flex_none().px(6).py(0).rounded(4).text_size(10).font_semibold()
+      .bg(tint(color, 0.18)).text_color(color).child(label.toUpperCase());
+    const blocks = this.mdCache.blocks.map((b, i) => {
+      if (b.type === "heading") {
+        const h = HEAD[b.level], parts = M.headingParts(b.text);
+        if (parts.delta) {
+          const color = DELTA[parts.delta];
+          return h_flex().mt(i ? 10 : 0).px(10).py(5).gap(8).items_center().rounded(6).border_l(3).border_color(color).bg(tint(color, 0.1))
+            .child(div().text_size(h.size).font_semibold().text_color(color).child(parts.text));
+        }
+        const labelColor = parts.label && (LABEL[parts.label.toLowerCase()] ?? h.color);
+        return h_flex().mt(i ? (b.level <= 2 ? 12 : 6) : 0).gap(8).items_center()
+          .when(b.level === 1, (e) => e.pb(6).border_b(1).border_color(tint(h.color, 0.4)))
+          .when(Boolean(parts.label), (e) => e.child(badge(parts.label, labelColor)))
+          .child(div().min_w(0).text_size(h.size).font_semibold().text_color(h.color).child(parts.text));
+      }
+      if (b.type === "para") return inline(i, b.text);
+      if (b.type === "rule") return div().my(4).h(1).bg(t.border);
+      if (b.type === "table") return inline(i, b.text);
+      if (b.type === "quote") return div().pl(12).py(2).border_l(3).border_color(t.ansi5).bg(tint(t.ansi5, 0.07)).text_color(t.muted).child(inline(i, b.text));
+      if (b.type === "code") {
+        return v_flex().px(12).py(8).rounded(6).border_l(3).border_color(t.ansi4).bg(t.surface).font_family(mono).text_size(12)
+          .when(Boolean(b.lang), (e) => e.child(div().text_size(10).text_color(t.dim).child(b.lang)))
+          .children(b.text.split("\n").map((l, j) => div().id(`${id}-${i}-l${j}`).min_h(17).text_color(t.foreground).whitespace_nowrap().child(l.replace(/\t/g, "    ") || " ")));
+      }
+      return v_flex().gap(3).children(b.items.map((it, j) => {
+        const mark = it.checked === true ? div().text_color(t.ansi2).font_semibold().child("✓")
+          : it.checked === false ? div().text_color(t.ansi3).child("○")
+          : it.ordered ? div().text_color(t.ansi3).font_semibold().child(it.marker)
+          : div().text_color(it.depth ? t.ansi5 : t.ansi6).child(it.depth ? "◦" : "•");
+        return h_flex().items_start().gap(8).pl(it.depth * 18)
+          .child(div().flex_none().min_w(14).child(mark))
+          .child(div().flex_1().min_w(0).child(inline(`${i}-${j}`, it.text)));
+      }));
+    });
+    return v_flex().gap(8).children(blocks);
   }
 
   renderFooter(t) {
