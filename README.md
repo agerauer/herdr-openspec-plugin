@@ -69,7 +69,7 @@ Opening it again in the same tab focuses the existing pane. Every action is also
 
 Differences from the terminal plugin:
 
-- **Agent hand-off** goes to the Claude Code agent in the pane's tab (the one it was opened beside, if it's still there), not to whichever pane is geometrically on the left.
+- **Agent hand-off:** `apply` and `archive` go to the Claude Code agent in the pane's tab (the one it was opened beside, if it's still there), not to whichever pane is geometrically on the left. `investigate` doesn't use an existing session: it opens a new tab in the current space running `claude --model sonnet` in the change's project, with the investigate prompt as its first message.
 - **Mouse capture (`m`) is gone:** text in documents is selectable directly.
 - **Your changes come first**, under a *Yours* heading above *Others*. A change is yours when the commit that created it has your `git config user.email`, `user.name` or GitHub login, or when it isn't committed yet. The usual worktree ordering applies inside each section.
 - **One tab per OpenSpec project** instead of one mixed list: when the workspace has nested `openspec/` trees, a tab bar shows each project with its change count (in the accent colour if your branch touches it). Click a tab, or press `[`/`]` or `Tab`/`Shift-Tab`, to switch; each tab remembers its selection. The pane opens on the project holding your branch's change.

@@ -444,6 +444,7 @@ export default class OpenSpecReview extends View {
   send(change, cx) {
     const command = M.agentCommandFor(change), action = M.actionForState(change.state);
     if (!command) return;
+    if (action === "investigate") return this.investigate(change, command, cx);
     const me = this.myPane(), tab = me?.tab ?? focused()?.tab;
     const inTab = agents().filter((a) => a.tab === tab);
     const opener = props()?.agent;
@@ -459,6 +460,21 @@ export default class OpenSpecReview extends View {
       this.say(`Sent ${action} → ${target.title || target.program?.name || target.address}`, cx);
       run("pane.focus", { pane: target.pane });
     });
+  }
+
+  /** Investigate starts its own Claude Code (Sonnet) in a new tab of this space, in the
+   *  change's project, with the prompt as its first message. */
+  investigate(change, prompt, cx) {
+    const tab = (this.panel ? null : this.myPane()?.tab) ?? focused()?.tab;
+    const space = spaces().find((s) => s.tabs.some((t) => t.id === tab)) ?? spaces().find((s) => s.id === focused()?.space);
+    run("tab.new", {
+      ...(space ? { space: space.id } : {}),
+      name: `investigate ${change.folder}`,
+      folder: change.project,
+      argv: ["claude", "--model", "sonnet"],
+      task: prompt,
+    });
+    this.say(`Opened a Sonnet session to investigate ${change.folder}`, cx);
   }
 
   closePane() {
