@@ -13,6 +13,7 @@ import * as M from "./model.js";
 const MOD = "openspec-review";
 const CARD_H = 90;
 const HEAD_H = 22;
+const LOAD_TIMEOUT = 45000;
 const LINE_PX = 20;
 const CHAR_PX = 7.4; // approximate width of one 13px UI character, for fitting card lines
 // Reads write nothing under .git, so the folder watch doesn't see our own queries.
@@ -205,17 +206,20 @@ export default class OpenSpecReview extends View {
     const f = focused();
     if (!f) return;
     // Focus on the panel itself (or another mod) says nothing new about where you work.
-    if (!f.cwd && f.tab === this.followedTab) return;
+    if (!f.cwd && f.tab === this.followedTab && this.start) return;
     this.followedTab = f.tab;
     const space = spaces().find((s) => s.id === f.space);
     const on = space?.machine ?? null;
     const folder = f.cwd || this.tabFolder(f.tab) || space?.folder || "";
     if (!folder || (folder === this.followed && on === this.on)) return;
-    this.followed = folder;
+    const want = `${on ?? ""}\n${folder}`;
+    if (this.following === want && Date.now() - this.followingSince < 5000) return; // resolving it
+    this.following = want; this.followingSince = Date.now();
     const token = (this.followToken = (this.followToken || 0) + 1);
     cx.spawn(async (cx) => {
       const root = await resolveSearchRoot(folder, on);
       if (token !== this.followToken) return; // focus moved on meanwhile
+      this.followed = folder; this.following = null;
       if (root === this.root && on === this.on) { this.start = folder; return; }
       this.on = on; this.start = folder;
       this.root = null; this.projects = null; this.all = []; this.changes = [];
@@ -262,12 +266,16 @@ export default class OpenSpecReview extends View {
 
   reload(cx) {
     if (!this.start) return;
-    if (this.loading) { this.pending = true; return; }
-    this.loading = true;
+    // One load at a time; a load that never came back (its task was dropped, or a command
+    // hung) must not block the pane forever, so after a while a new one replaces it.
+    if (this.loading && Date.now() - this.loadingSince < LOAD_TIMEOUT) { this.pending = true; return; }
+    const gen = (this.loadGen = (this.loadGen || 0) + 1);
+    this.loading = true; this.loadingSince = Date.now();
     const start = this.start, on = this.on;
     cx.spawn(async (cx) => {
       try {
         const { root, projects, changes } = await loadWorkspace(start, on);
+        if (gen !== this.loadGen) return; // replaced by a newer load
         // The panel moved to another folder while this ran: drop it and load the new one.
         if (start !== this.start || on !== this.on) { this.pending = true; return; }
         const selected = this.change?.name;
@@ -285,10 +293,12 @@ export default class OpenSpecReview extends View {
           else await this.refreshDoc(cx);
         }
         this.watch(projects, cx);
-      } catch (e) { this.error = String(e); }
+      } catch (e) { if (gen === this.loadGen) this.error = String(e); }
       finally {
-        this.loading = false; cx.notify();
-        if (this.pending) { this.pending = false; this.reload(cx); }
+        if (gen === this.loadGen) {
+          this.loading = false; cx.notify();
+          if (this.pending) { this.pending = false; this.reload(cx); }
+        }
       }
     });
   }
@@ -502,8 +512,10 @@ export default class OpenSpecReview extends View {
   // ---- Drawing ----
 
   render(cx) {
-    if (this.panel && !this.launcher && focused()?.tab !== this.followedTab) {
-      this.followedTab = focused()?.tab ?? null;
+    // Follow a tab switch right away rather than at the next tick (follow() records the tab).
+    const tab = focused()?.tab ?? null;
+    if (this.panel && !this.launcher && tab !== this.followedTab && tab !== this.renderedTab) {
+      this.renderedTab = tab;
       cx.timer.after(0, (cx) => { this.follow(cx); cx.notify(); });
     }
     if (this.launcher) return div();
